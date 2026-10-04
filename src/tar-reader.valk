@@ -1,0 +1,461 @@
+use valk.io
+use valk.fs
+use valk.compress
+
+value TAR_CHUNK (65536)
+// PAX and GNU long-name headers larger than this are refused
+value TAR_META_LIMIT (16777216)
+
+// Hands out `prefix` first, then reads `source`
+class PrefixReader is io.Reader {
+    prefix: &[u8]
+    source: io.Reader
+    at: uint (0)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.at < this.prefix.length {
+            let count = this.prefix.length - this.at
+            if count > buf.length : count = buf.length
+            copy_into(this.prefix.view(this.at, count), buf)
+            this.at += count
+            return count
+        }
+        return this.source.read(buf) !>
+    }
+}
+
+/// Reads a TAR archive entry by entry from any `io.Reader`, gzip-compressed or not.
+///
+/// Only one chunk of the input is held in memory, so a `.tar.gz` of any size streams
+/// through. Reads ustar, PAX (long names, large sizes, exact times) and GNU long names.
+///
+/// ```valk
+/// let tar = archive.TarReader.open("backup.tar.gz") ! panic(E.message)
+/// while true {
+///     let entry = tar.next() ! panic(E.message)
+///     if !isset(entry) : break
+///     if entry.is_file() : println(entry.name + ": " + tar.read() ! panic(E.message))
+/// }
+/// ```
++ class TarReader {
+    - source: io.Reader
+    - file: ?fs.FileStream (null)
+    - file_size: uint (0)
+    - chunk: mut &[u8]
+    - pos: uint (0)
+    - end: uint (0)
+    - eof: bool (false)
+    - finished: bool (false)
+    // Bytes of the current entry not read yet, and the padding after them
+    - remaining: uint (0)
+    - padding: uint (0)
+    - current: ?Entry (null)
+    // Counts entries, so a stream of an earlier entry stops
+    - generation: uint (0)
+    - globals: Map[String] (.{})
+
+    /// Reads a TAR archive from `source`. Gzip data is recognized and decompressed.
+    ///
+    /// bzip2 and xz are recognized too, and throw `unsupported` on the first `next`.
+    + static fn new(source: io.Reader) TarReader {
+        return TarReader { source: source, chunk: [u8]{ 0 x TAR_CHUNK } }
+    }
+
+    /// Opens the TAR file at `path`, which may be gzip-compressed (`.tar.gz`, `.tgz`).
+    ///
+    /// The file closes when the last entry was read, or on `close`.
+    + static fn open(path: String) TarReader !Error {
+        let file = fs.stream(path) ! throw .io { message: "Cannot open '" + path + "'" }
+        let reader = TarReader.new(file)
+        reader.file = file
+        reader.file_size = fs.size(path) ! throw .io { message: "Cannot open '" + path + "'" }
+        return reader
+    }
+
+    /// Returns the next entry, or `null` after the last one.
+    ///
+    /// The contents of the entry can be read with `read`, `read_into` or `stream` until the
+    /// next call; what is left of them is skipped.
+    + fn next() ?Entry !Error {
+        if this.generation == 0 : this.detect() !>
+        this.generation++
+        this.current = null
+        if this.finished : return null
+        this.skip(this.remaining + this.padding) !>
+        this.remaining = 0
+        this.padding = 0
+        let pax = Map[String]{}
+        let long_name: ?String = null
+        let long_link: ?String = null
+        let header = [u8]{ 0 x 512 }
+        while true {
+            let got = this.fill(header) !>
+            if got == 0 || is_zero_block(header) {
+                this.finish()
+                return null
+            }
+            if got < 512 : throw .format { message: "The TAR archive ends inside a header" }
+            this.check_header(header) !>
+            let type = header[156]
+            let size = parse_number(header, 124, 12) !>
+            if type == 'x' || type == 'g' || type == 'L' || type == 'K' {
+                if size > TAR_META_LIMIT : throw .format { message: "A TAR extended header is too large" }
+                let data = this.read_meta(size) !>
+                if type == 'L' {
+                    long_name = trim_nul(data)
+                } else if type == 'K' {
+                    long_link = trim_nul(data)
+                } else {
+                    parse_pax(data, type == 'g' ? this.globals : pax) !>
+                }
+                continue
+            }
+            let entry = this.make_entry(header, size, pax, long_name, long_link) !>
+            // Links, directories, devices and FIFOs carry no data
+            let has_data = type < '1' || type > '6'
+            let data_size = has_data ? size : 0
+            if !has_data : entry.size = 0
+            this.remaining = data_size
+            this.padding = (512 - data_size % 512) % 512
+            this.current = entry
+            return entry
+        }
+    }
+
+    /// Returns the contents of the current entry, or what is left of them.
+    + fn read() String !Error {
+        let out = ByteBuffer.new(this.remaining + 1)
+        this.read_into(out) !>
+        return out.to_string()
+    }
+
+    /// Writes the contents of the current entry to `out` and returns the bytes written.
+    + fn read_into(out: io.Writer) uint !Error {
+        let total: uint = 0
+        match out {
+            ByteBuffer as buffer => {
+                while this.remaining > 0 {
+                    let want = this.remaining > TAR_CHUNK ? TAR_CHUNK : this.remaining
+                    buffer.reserve(want)
+                    let count = this.read_data(buffer.view_spare(want)) !>
+                    buffer.skip(count)
+                    total += count
+                }
+            }
+            default => {
+                let chunk = [u8]{ 0 x TAR_CHUNK }
+                while true {
+                    let count = this.read_data(chunk) !>
+                    if count == 0 : break
+                    write_all(out, chunk.view(0, count)) ! throw .io { message: "Writing the entry failed" }
+                    total += count
+                }
+            }
+        }
+        return total
+    }
+
+    /// Returns an `io.Reader` over the contents of the current entry.
+    ///
+    /// It reads nothing more once `next` is called.
+    + fn stream() TarEntryReader {
+        return TarEntryReader { tar: this, generation: this.generation }
+    }
+
+    /// Extracts the rest of the archive into the directory `dir`, which is created when missing.
+    ///
+    /// Throws `unsafe_path` for an entry that would end up outside `dir`: an absolute name,
+    /// a `..` component, or a symlink or hard link that points out of it. Entries before it are
+    /// already written then. Devices and FIFOs are skipped. See `archive.extract`.
+    + fn extract(dir: String) !Error {
+        let target = Extractor.new(dir) !>
+        while true {
+            let entry = this.next() !>
+            if !isset(entry) : break
+            if entry.kind == EntryKind.file {
+                let file = target.create_file(entry) !>
+                this.read_into(file) ! {
+                    file.close() _
+                    throw E
+                }
+                file.close() ! throw .io { message: "Cannot write '" + entry.name + "'" }
+                continue
+            }
+            target.add(entry) !>
+        }
+    }
+
+    /// Closes the file that `open` opened. A reader over another source leaves closing it to
+    /// its owner.
+    + fn close() {
+        let file = this.file
+        if isset(file) : file.close() _
+        this.finished = true
+    }
+
+    fn finish() {
+        this.finished = true
+        this.remaining = 0
+        this.padding = 0
+        let file = this.file
+        if isset(file) : file.close() _
+    }
+
+    // Recognizes compressed input by its first bytes
+    fn detect() !Error {
+        let got = read_full(this.source, this.chunk.view(0, 512)) ! throw .io { message: "Reading the TAR archive failed" }
+        let head = this.chunk.view(0, got)
+        if got >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+            let prefix = head.to_string()
+            this.source = compress.Decompressor.new(PrefixReader { prefix: prefix, source: this.source }, compress.Format.gzip)
+            return
+        }
+        if got >= 3 && head.starts_with("BZh") : throw .unsupported { message: "bzip2-compressed TAR archives are not supported" }
+        if got >= 6 && head.starts_with("\xfd7zXZ\x00") : throw .unsupported { message: "xz-compressed TAR archives are not supported" }
+        this.pos = 0
+        this.end = got
+        if got < 512 : this.eof = true
+    }
+
+    // Reads up to `buf.length` bytes from the archive
+    fn fill(buf: local mut &[u8]) uint !Error {
+        let total: uint = 0
+        while total < buf.length {
+            if this.pos == this.end {
+                if this.eof : break
+                let want = buf.length - total
+                if want >= TAR_CHUNK {
+                    // Large reads skip the chunk
+                    let count = this.read_source(buf.view(total, want)) !>
+                    if count == 0 : break
+                    total += count
+                    continue
+                }
+                let count = this.read_source(this.chunk) !>
+                if count == 0 : break
+                this.pos = 0
+                this.end = count
+            }
+            let count = this.end - this.pos
+            if count > buf.length - total : count = buf.length - total
+            copy_into(this.chunk.view(this.pos, count), buf.view(total, count))
+            this.pos += count
+            total += count
+        }
+        return total
+    }
+
+    fn read_source(buf: local mut &[u8]) uint !Error {
+        let count = this.source.read(buf) ! {
+            if E.code == E.closed : return 0
+            throw .io { message: "Reading the TAR archive failed" }
+        }
+        if count == 0 : this.eof = true
+        return count
+    }
+
+    fn skip(amount: uint) !Error {
+        if amount == 0 : return
+        let buffered = this.end - this.pos
+        if amount <= buffered {
+            this.pos += amount
+            return
+        }
+        amount -= buffered
+        this.pos = this.end
+        // A file that `open` opened seeks over the data, unless it is compressed
+        let source = this.source
+        if this.file_size > 0 {
+            match source {
+                fs.FileStream as file => {
+                    if file.position + amount > this.file_size : throw .format { message: "The TAR archive ends inside an entry" }
+                    file.seek(amount.to(int), io.SeekFrom.current) ! throw .io { message: "Reading the TAR archive failed" }
+                    return
+                }
+                default => {}
+            }
+        }
+        while amount > 0 {
+            let want = amount > TAR_CHUNK ? TAR_CHUNK : amount
+            let count = this.read_source(this.chunk.view(0, want)) !>
+            if count == 0 : throw .format { message: "The TAR archive ends inside an entry" }
+            amount -= count
+        }
+    }
+
+    fn read_data(buf: local mut &[u8]) uint !Error {
+        if this.remaining == 0 || buf.length == 0 : return 0
+        let want = buf.length > this.remaining ? this.remaining : buf.length
+        let count = this.fill(buf.view(0, want)) !>
+        if count < want : throw .format { message: "The TAR archive ends inside an entry" }
+        this.remaining -= count
+        return count
+    }
+
+    fn read_meta(size: uint) String !Error {
+        let data = [u8]{ 0 x size }
+        if (this.fill(data) !>) != size : throw .format { message: "The TAR archive ends inside a header" }
+        this.skip((512 - size % 512) % 512) !>
+        return data.to_string()
+    }
+
+    fn check_header(header: local &[u8]) !Error {
+        let stored = parse_octal(header, 148, 8) ! throw .format { message: "Not a TAR archive: the header checksum is not a number" }
+        let unsigned: uint = 0
+        let signed: int = 0
+        each header as byte, i {
+            let b = (i >= 148 && i < 156) ? 32 : byte
+            unsigned += b
+            signed += b >= 128 ? b.to(int) - 256 : b.to(int)
+        }
+        if stored != unsigned && stored.to(int) != signed : throw .checksum { message: "The TAR header checksum does not match" }
+    }
+
+    fn make_entry(header: local &[u8], size: uint, pax: Map[String], long_name: ?String, long_link: ?String) Entry !Error {
+        let type = header[156]
+        let name = long_name ?? field_string(header, 0, 100)
+        if !isset(long_name) && header.equals_at(257, 5, "ustar") {
+            let prefix = field_string(header, 345, 155)
+            // GNU headers use this space for other fields
+            if prefix.length > 0 && header[262] == 0 : name = prefix + "/" + name
+        }
+        let link = long_link ?? field_string(header, 157, 100)
+        let mode = (parse_number(header, 100, 8) !>) & 0c7777
+        let mtime_value = parse_time(header, 136, 12) !>
+        // PAX records override the header; per-entry ones override global ones
+        each this.globals as value, key {
+            if !pax.has(key) : pax.set(key, value)
+        }
+        if pax.has("path") : name = pax.get("path") !? name
+        if pax.has("linkpath") : link = pax.get("linkpath") !? link
+        if pax.has("size") : size = (pax.get("size") !? "").to_uint() ! throw .format { message: "A PAX size is not a number" }
+        if pax.has("mtime") : mtime_value = parse_pax_time(pax.get("mtime") !? "0") !>
+        let kind = EntryKind.other
+        if type == '0' || type == 0 || type == '7' {
+            kind = name.ends_with("/") ? EntryKind.directory : EntryKind.file
+        } else if type == '5' {
+            kind = EntryKind.directory
+        } else if type == '2' {
+            kind = EntryKind.symlink
+        } else if type == '1' {
+            kind = EntryKind.hardlink
+        }
+        while name.length > 1 && name.ends_with("/") {
+            name = name.range(0, name.length - 1)
+        }
+        return Entry {
+            name: name
+            kind: kind
+            size: size
+            mode: mode.to(u32)
+            mtime: mtime_value
+            link: kind == EntryKind.symlink || kind == EntryKind.hardlink ? link : ""
+            compressed_size: size
+        }
+    }
+}
+
+/// Reads the contents of the current TAR entry; returned by `TarReader.stream`.
++ class TarEntryReader is io.Reader {
+    - tar: TarReader
+    - generation: uint
+
+    /// Fills `buf` with the next bytes of the entry and returns the count; 0 at the end.
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.generation != this.tar.generation : return 0
+        return this.tar.read_data(buf) ! throw .read
+    }
+}
+
+fn is_zero_block(block: local &[u8]) bool {
+    each block as byte {
+        if byte != 0 : return false
+    }
+    return true
+}
+
+fn trim_nul(text: String) String {
+    let end = text.length
+    while end > 0 && text[end - 1] == 0 : end--
+    return text.range(0, end)
+}
+
+// A NUL-terminated text field
+fn field_string(header: local &[u8], at: uint, length: uint) String {
+    let end: uint = 0
+    while end < length && header[at + end] != 0 : end++
+    return header.view(at, end).to_string()
+}
+
+fn parse_octal(header: local &[u8], at: uint, length: uint) uint !Error {
+    let i = at
+    let end = at + length
+    while i < end && (header[i] == ' ' || header[i] == 0) : i++
+    let value: uint = 0
+    while i < end {
+        let c = header[i]
+        if c == ' ' || c == 0 : break
+        if c < '0' || c > '7' : throw .format { message: "A TAR header field is not an octal number" }
+        value = (value << 3) | (c - '0')
+        i++
+    }
+    return value
+}
+
+// Octal, or base-256 when the first byte has its high bit set
+fn parse_number(header: local &[u8], at: uint, length: uint) uint !Error {
+    let first = header[at]
+    if (first & 0x80) == 0 : return parse_octal(header, at, length) !>
+    if first == 0xff : return 0
+    let value: uint = (first & 0x7f).to(uint)
+    let i: uint = 1
+    while i < length {
+        if (value >> 56) != 0 : throw .format { message: "A TAR header number is too large" }
+        value = (value << 8) | header[at + i]
+        i++
+    }
+    return value
+}
+
+// A time may be negative in base-256: two's complement in the last 8 bytes
+fn parse_time(header: local &[u8], at: uint, length: uint) int !Error {
+    if header[at] != 0xff : return (parse_number(header, at, length) !>).to(int)
+    let value: u64 = 0
+    let i = length - 8
+    while i < length {
+        value = (value << 8) | header[at + i]
+        i++
+    }
+    return value.to(i64).to(int)
+}
+
+// PAX records: "<length> <key>=<value>\n"
+fn parse_pax(data: String, into: Map[String]) !Error {
+    let at: uint = 0
+    while at < data.length {
+        let space = data.index_of_byte(' ', at) ! throw .format { message: "A PAX record is damaged" }
+        let length = data.range(at, space - at).to_uint() ! throw .format { message: "A PAX record length is not a number" }
+        if length == 0 || at + length > data.length || data[at + length - 1] != '\n' : throw .format { message: "A PAX record is damaged" }
+        let record = data.range(space + 1, at + length - space - 2)
+        let eq = record.index_of_byte('=') ! throw .format { message: "A PAX record has no '='" }
+        let key = record.range(0, eq)
+        let value = record.range(eq + 1, record.length - eq - 1)
+        into.set(key, value)
+        at += length
+    }
+}
+
+// Seconds with an optional fraction, which is dropped
+fn parse_pax_time(text: String) int !Error {
+    let negative = text.starts_with("-")
+    let digits = negative ? text.range(1, text.length - 1) : text
+    let dot = digits.index_of_byte('.') !? digits.length
+    let seconds = digits.range(0, dot).to_uint() ! throw .format { message: "A PAX time is not a number" }
+    let value = seconds.to(int)
+    if negative {
+        value = -value
+        // Round toward minus infinity, as the fraction counts up from there
+        if dot < digits.length && digits.range(dot + 1, digits.length - dot - 1).trim("0").length > 0 : value--
+    }
+    return value
+}

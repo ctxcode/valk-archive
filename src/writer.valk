@@ -1,0 +1,98 @@
+use valk.io
+use valk.fs
+
+/// What `ZipWriter` and `TarWriter` have in common, for code that writes either format.
++ interface Writer {
+    /// Adds a file with the contents `data`.
+    + fn add(name: String, data: local &[u8], options: Options (Options{})) !Error;
+    /// Adds a file of exactly `size` bytes read from `source`, in pieces.
+    + fn add_from(name: String, source: io.Reader, size: uint, options: Options (Options{})) !Error;
+    /// Adds a directory.
+    + fn add_dir(name: String, options: Options (Options{})) !Error;
+    /// Adds a symlink that points to `target`.
+    + fn add_symlink(name: String, target: String, options: Options (Options{})) !Error;
+    /// Writes what is left and ends the archive.
+    + fn close() !Error;
+
+    /// Adds the file or directory at `path` under `name`, with its mode and modification time.
+    ///
+    /// A file is streamed from disk, so it never has to fit in memory. A directory is added
+    /// without its contents; `add_tree` adds those.
+    + fn add_file(path: String, name: String) !Error {
+        let info = fs.stat(path) ! throw .io { message: "Cannot read '" + path + "'" }
+        let options = Options { mode: info.permissions & 0c7777, mtime: (info.modified_time / 1000000000).to(int) }
+        if info.kind == fs.FileKind.directory {
+            this.add_dir(name, options) !>
+            return
+        }
+        let file = fs.stream(path) ! throw .io { message: "Cannot open '" + path + "'" }
+        this.add_from(name, file, info.size, options) ! {
+            file.close() _
+            throw E
+        }
+        file.close() _
+    }
+
+    /// Adds everything below the directory `dir`, with names relative to it after `prefix`.
+    ///
+    /// Entries are added in sorted order, directories included. Symlinks are stored as
+    /// symlinks, not followed; on Windows they are skipped.
+    ///
+    /// ```valk
+    /// zip.add_tree("public", "site/") ! panic(E.message)
+    /// ```
+    + fn add_tree(dir: String, prefix: String ("")) !Error {
+        let names = fs.files_in(dir, true, true, true, true) ! throw .io { message: "Cannot list '" + dir + "'" }
+        names.sort()
+        each names as rel {
+            let path = fs.add(dir, rel)
+            let name = prefix + rel.replace("\\", "/")
+            if fs.is_symlink(path) {
+                #if OS != "win"
+                this.add_symlink(name, read_link(path) !>) !>
+                #end
+                continue
+            }
+            this.add_file(path, name) !>
+        }
+    }
+}
+
+// The mode an entry gets when the options give none
+fn mode_of(options: Options, kind: EntryKind) u32 {
+    if options.mode != 0 : return options.mode & 0c7777
+    if kind == EntryKind.directory : return 0c755
+    if kind == EntryKind.symlink : return 0c777
+    return 0c644
+}
+
+// Throws for names that `extract` would refuse
+fn check_new_name(name: String) !Error {
+    if clean_name(name).length == 0 : throw .unsafe_path { message: "An entry needs a name" }
+    check_name(name) !>
+}
+
+// Copies exactly `size` bytes from `source` to `out`, and returns their CRC-32 when `crc` is set
+fn copy_exact(source: io.Reader, out: io.Writer, size: uint, crc: bool) u32 !Error {
+    let chunk = [u8]{ 0 x (size < 65536 ? (size == 0 ? 1 : size) : 65536) }
+    let left = size
+    let sum: u32 = 0
+    while left > 0 {
+        let want = left > chunk.length ? chunk.length : left
+        let count = read_some(source, chunk.view(0, want)) !>
+        if count == 0 : throw .io { message: "The source ended after " + (size - left) + " of " + size + " bytes" }
+        let piece = chunk.view(0, count)
+        if crc : sum = crc32(piece, sum)
+        out.write(piece) ! throw .io { message: "Writing the archive failed" }
+        left -= count
+    }
+    return sum
+}
+
+// One read; `closed` counts as the end
+fn read_some(source: io.Reader, buf: local mut &[u8]) uint !Error {
+    return source.read(buf) ! {
+        if E.code == E.closed : return 0
+        throw .io { message: "Reading the source failed" }
+    }
+}

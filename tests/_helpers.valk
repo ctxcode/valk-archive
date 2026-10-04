@@ -1,0 +1,67 @@
+use archive
+use valk.io
+use valk.fs
+
+// A source that hands out at most `step` bytes per read
+class TrickleReader is io.Reader {
+    text: String
+    step: uint
+    at: uint (0)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        let count = this.text.length - this.at
+        if count > this.step : count = this.step
+        if count > buf.length : count = buf.length
+        let i: uint = 0
+        while i < count {
+            buf[i] = this.text[this.at + i]
+            i++
+        }
+        this.at += count
+        return count
+    }
+}
+
+// A fresh directory below tests/tmp
+fn temp_dir(name: String) String {
+    let dir = "tests/tmp/" + name
+    fs.delete_all(dir) _
+    fs.create_dir_all(dir) !!
+    return dir
+}
+
+// Every entry of a TAR archive with its contents
+fn tar_entries(data: String) Array[(archive.Entry, String)] !archive.Error {
+    let tar = archive.TarReader.new(TrickleReader { text: data, step: 777 })
+    let result = Array[(archive.Entry, String)]{}
+    while true {
+        let entry = tar.next() !>
+        if !isset(entry) : break
+        result.append((entry, tar.read() !>))
+    }
+    return result
+}
+
+// Text of `length` bytes that compresses somewhat
+fn sample_text(length: uint, seed: uint (1)) String {
+    let out = ByteBuffer.new(length)
+    let x = seed
+    while out.length < length {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let word = x % 50
+        out.write("word" + word + " ")
+        if x % 13 == 0 : out.write_byte('\n')
+    }
+    return out.range(0, length)
+}
+
+// Bytes that do not compress
+fn random_bytes(length: uint, seed: uint (7)) String {
+    let out = ByteBuffer.new(length)
+    let x = seed
+    while out.length < length {
+        x = (x * 6364136223846793005 + 1442695040888963407)
+        out.write_byte((x >> 56).to(u8))
+    }
+    return out.to_string()
+}

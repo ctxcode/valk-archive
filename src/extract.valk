@@ -1,0 +1,100 @@
+use valk.fs
+
+fn check_entry(entry: Entry) !Error {
+    check_name(entry.name) !>
+    if entry.kind == EntryKind.symlink && !link_stays_inside(entry.name, entry.link) {
+        throw .unsafe_path { message: "The symlink '" + entry.name + "' points outside the directory, to '" + entry.link + "'" }
+    }
+    if entry.kind == EntryKind.hardlink {
+        check_name(entry.link) ! throw .unsafe_path { message: "The hard link '" + entry.name + "' points outside the directory, to '" + entry.link + "'" }
+    }
+}
+
+// Writes entries below one directory, and never through a symlink
+class Extractor {
+    root: String
+    // Directories below the root that are known to be real directories
+    dirs: HashSet[String] (.{})
+
+    static fn new(dir: String) Extractor !Error {
+        fs.create_dir_all(dir) ! throw .io { message: "Cannot create the directory '" + dir + "'" }
+        return Extractor { root: fs.resolve(dir) }
+    }
+
+    // Creates the file of an entry, with its parent directories
+    fn create_file(entry: Entry) fs.FileStream !Error {
+        let path = this.prepare(entry) !>
+        if path.length == 0 : throw .io { message: "The entry '" + entry.name + "' has no name" }
+        let file = fs.stream(path, fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true, permissions: file_mode(entry.mode) }) ! throw .io { message: "Cannot create '" + path + "'" }
+        #if OS != "win"
+        fs.chmod(path, file_mode(entry.mode)) ! throw .io { message: "Cannot set the mode of '" + path + "'" }
+        #end
+        return file
+    }
+
+    // Directories and links; other kinds are skipped
+    fn add(entry: Entry) !Error {
+        check_entry(entry) !>
+        if entry.kind == EntryKind.directory {
+            let clean = clean_name(entry.name)
+            if clean.length > 0 : this.make_dirs(clean, true) !>
+            return
+        }
+        if entry.kind == EntryKind.symlink {
+            let path = this.prepare(entry) !>
+            fs.symlink(path, entry.link) ! throw .io { message: "Cannot create the symlink '" + path + "'" }
+            return
+        }
+        if entry.kind == EntryKind.hardlink {
+            let source_name = clean_name(entry.link)
+            this.make_dirs(source_name, false) !>
+            let source = fs.add(this.root, source_name)
+            if fs.is_symlink(source) || !fs.is_file(source) : throw .io { message: "The hard link '" + entry.name + "' points to '" + entry.link + "', which is not an extracted file" }
+            let path = this.prepare(entry) !>
+            fs.copy(source, path) ! throw .io { message: "Cannot create '" + path + "'" }
+        }
+    }
+
+    // Checks the entry, creates its parents and clears the place it goes to
+    fn prepare(entry: Entry) String !Error {
+        check_entry(entry) !>
+        let clean = clean_name(entry.name)
+        if clean.length == 0 : return ""
+        this.make_dirs(clean, false) !>
+        let path = fs.add(this.root, clean)
+        if fs.is_symlink(path) {
+            fs.delete_file(path) ! throw .io { message: "Cannot replace '" + path + "'" }
+        } else if fs.is_dir(path) {
+            throw .io { message: "Cannot extract '" + entry.name + "': a directory is in the way" }
+        } else if fs.exists(path) {
+            // A new file, so an existing hard link is not written through
+            fs.delete_file(path) ! throw .io { message: "Cannot replace '" + path + "'" }
+        }
+        return path
+    }
+
+    // Creates the directories of a clean name: all of them, or all but the last component
+    fn make_dirs(clean: String, all: bool) !Error {
+        let parts = clean.split("/")
+        let count = all ? parts.length : parts.length - 1
+        let rel = ""
+        each parts as part, i {
+            if i >= count : break
+            rel = i == 0 ? part : rel + "/" + part
+            if this.dirs.has(rel) : continue
+            let path = fs.add(this.root, rel)
+            if fs.is_symlink(path) : throw .unsafe_path { message: "Cannot extract '" + clean + "' through the symlink '" + rel + "'" }
+            if !fs.exists(path) {
+                fs.create_dir(path) ! throw .io { message: "Cannot create the directory '" + path + "'" }
+            } else if !fs.is_dir(path) {
+                throw .io { message: "Cannot extract '" + clean + "': '" + rel + "' is not a directory" }
+            }
+            this.dirs.add(rel)
+        }
+    }
+}
+
+// Owner read and write, no group or other write, no setuid, setgid or sticky bits
+fn file_mode(mode: u32) u32 {
+    return (mode & 0c755) | 0c600
+}

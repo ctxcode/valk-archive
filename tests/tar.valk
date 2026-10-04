@@ -1,0 +1,116 @@
+use archive
+use valk.io
+use valk.compress
+
+fn tar_of(gzip: bool, build: fn(archive.TarWriter)(void !archive.Error)) String {
+    let out = ByteBuffer.new()
+    let tar = archive.TarWriter.new(out, gzip)
+    build(tar) !!
+    tar.close() !!
+    return out.to_string()
+}
+
+test "TAR round trip" {
+    let text = sample_text(100000)
+    let long_name = "dir/" + "x".repeat(150) + "/file.txt"
+    let longer_name = "y".repeat(300)
+    let split_name = "a".repeat(90) + "/" + "b".repeat(90) + "/c.txt"
+    let build = fn(tar: archive.TarWriter) !archive.Error {
+        tar.add("a.txt", "hello", archive.Options { mtime: 1700000000, mode: 0c640 }) !>
+        tar.add_dir("dir", archive.Options { mtime: 1600000000 }) !>
+        tar.add("dir/big.txt", text) !>
+        tar.add_from("streamed.txt", TrickleReader { text: text, step: 999 }, text.length) !>
+        tar.add(long_name, "long") !>
+        tar.add(longer_name, "longer") !>
+        tar.add(split_name, "split") !>
+        tar.add("naïve.txt", "unicode") !>
+        tar.add_symlink("link", "x".repeat(120)) !>
+        tar.add("old.txt", "old", archive.Options { mtime: -1000 }) !>
+        tar.add("future.txt", "future", archive.Options { mtime: 0c77777777777 + 10 }) !>
+        tar.add("empty", "") !>
+    }
+    each Array[bool]{ false, true } as gzip {
+        let data = tar_of(gzip, build)
+        if !gzip : assert(data.length % 10240 == 0)
+        if gzip : assert(data[0] == 0x1f)
+        let entries = tar_entries(data) !!
+        assert(entries.length == 12)
+        let a = entries[0][0]
+        assert(a.name == "a.txt" && a.size == 5 && a.mtime == 1700000000 && a.mode == 0c640 && a.is_file())
+        assert(entries[0][1] == "hello")
+        let dir = entries[1][0]
+        assert(dir.name == "dir" && dir.is_dir() && dir.mode == 0c755 && dir.mtime == 1600000000)
+        assert(entries[2][1] == text)
+        assert(entries[3][1] == text)
+        assert(entries[4][0].name == long_name && entries[4][1] == "long")
+        assert(entries[5][0].name == longer_name && entries[5][1] == "longer")
+        assert(entries[6][0].name == split_name && entries[6][1] == "split")
+        assert(entries[7][0].name == "naïve.txt")
+        let link = entries[8][0]
+        assert(link.kind == archive.EntryKind.symlink && link.link == "x".repeat(120) && link.size == 0)
+        assert(entries[9][0].mtime == -1000)
+        assert(entries[10][0].mtime == 0c77777777777 + 10)
+        assert(entries[11][1] == "")
+    }
+}
+
+test "TAR streaming reads" {
+    let text = sample_text(200000, 5)
+    let data = tar_of(true, fn(tar: archive.TarWriter) !archive.Error {
+        tar.add("one", text) !>
+        tar.add("two", "second") !>
+        tar.add("three", text) !>
+    })
+    let tar = archive.TarReader.new(TrickleReader { text: data, step: 5000 })
+    let one = tar.next() !! ?! panic("missing")
+    assert(one.name == "one")
+    // Read a part, then skip the rest
+    let stream = tar.stream()
+    let buf = [u8]{ 0 x 100 }
+    assert(stream.read(buf) !! == 100)
+    let two = tar.next() !! ?! panic("missing")
+    assert(two.name == "two")
+    // The old stream reads nothing more
+    assert(stream.read(buf) !! == 0)
+    let out = ByteBuffer.new()
+    assert(tar.read_into(out) !! == 6)
+    assert(out == "second")
+    let three = tar.next() !! ?! panic("missing")
+    assert(three.name == "three")
+    assert(io.read_all(tar.stream()) !! == text)
+    assert(!isset(tar.next() !!))
+    assert(!isset(tar.next() !!))
+}
+
+test "TAR damage is detected" {
+    let data = tar_of(false, fn(tar: archive.TarWriter) !archive.Error {
+        tar.add("a.txt", sample_text(3000)) !>
+    })
+    let copy = ByteBuffer.new()
+    copy.write(data)
+    copy[10] = 'Z'
+    let failed1 = false
+    tar_entries(copy.to_string()) ! failed1 = E.code == E.checksum
+    assert(failed1)
+    // Cut inside the data
+    let failed2 = false
+    tar_entries(data.range(0, 1500)) ! failed2 = E.code == E.format
+    assert(failed2)
+    // Cut inside a header
+    let failed3 = false
+    tar_entries(data.range(0, 300)) ! failed3 = E.code == E.format
+    assert(failed3)
+    // A truncated gzip stream
+    let gz = compress.gzip(data)
+    let failed4 = false
+    tar_entries(gz.range(0, gz.length / 2)) ! failed4 = E.code == E.format || E.code == E.io
+    assert(failed4)
+    // Without end blocks it still reads
+    let entries = tar_entries(data.range(0, 512 + 3072)) !!
+    assert(entries.length == 1)
+    // An empty input is an empty archive
+    assert((tar_entries("") !!).length == 0)
+    let failed5 = false
+    tar_entries("BZh91AY&SY" + "x".repeat(600)) ! failed5 = E.code == E.unsupported
+    assert(failed5)
+}

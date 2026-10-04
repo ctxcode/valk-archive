@@ -1,0 +1,79 @@
+use archive
+use valk.compress
+
+struct Expect {
+    name: String ("")
+    kind: String ("")
+    size: uint (0)
+    mode: u32 (0)
+    mtime: int (0)
+    link: String ("")
+    crc: u32 (0)
+    error: String ("")
+}
+
+struct Sample {
+    file: String
+    entries: Array[Expect]
+}
+
+fn check_entry(sample: String, entry: archive.Entry, data: String, expect: Expect) bool {
+    let crc = compress.crc32(data)
+    if entry.name != expect.name || entry.kind.name() != expect.kind || entry.size != expect.size || entry.mode != expect.mode || entry.mtime != expect.mtime || entry.link != expect.link || crc != expect.crc {
+        println(sample + ": got " + entry.name + " " + entry.kind + " " + entry.size + " " + entry.mode.to_base(8) + " " + entry.mtime + " '" + entry.link + "' " + crc)
+        println(sample + ": expected " + expect.name + " " + expect.kind + " " + expect.size + " " + expect.mode.to_base(8) + " " + expect.mtime + " '" + expect.link + "' " + expect.crc)
+        return false
+    }
+    return true
+}
+
+fn read_zip(sample: Sample) bool !archive.Error {
+    let zip = archive.ZipReader.open("tests/samples/" + sample.file) !>
+    defer zip.close()
+    let first = sample.entries.get(0) !? Expect{}
+    if first.error.length > 0 {
+        // Reading a file entry fails
+        let entry = zip.entries.find(fn(e: archive.Entry) bool { return e.is_file() }) ! return false
+        let failed = false
+        zip.read(entry.name) ! failed = E.code.name() == first.error
+        return failed
+    }
+    if zip.entries.length != sample.entries.length : return false
+    each sample.entries as expect, i {
+        let entry = zip.entries[i]
+        let data = entry.kind == archive.EntryKind.file ? (zip.read(entry.name) !>) : ""
+        if !check_entry(sample.file, entry, data, expect) : return false
+    }
+    return true
+}
+
+fn read_tar(sample: Sample) bool !archive.Error {
+    let tar = archive.TarReader.open("tests/samples/" + sample.file) !>
+    defer tar.close()
+    each sample.entries as expect {
+        let entry = tar.next() !> ?! return false
+        if !check_entry(sample.file, entry, tar.read() !>, expect) : return false
+    }
+    return !isset(tar.next() !>)
+}
+
+fn check_sample(sample: Sample) bool {
+    if sample.file.ends_with(".zip") {
+        return read_zip(sample) ! {
+            println(sample.file + ": " + E.message)
+            return false
+        }
+    }
+    return read_tar(sample) ! {
+        println(sample.file + ": " + E.message)
+        return false
+    }
+}
+
+test "Archives written by Python, zip and tar" {
+    each samples() as sample {
+        let ok = check_sample(sample)
+        if !ok : println("Failed: " + sample.file)
+        assert(ok)
+    }
+}

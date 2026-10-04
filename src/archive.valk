@@ -1,0 +1,58 @@
+use valk.fs
+
+/// Extracts the ZIP or TAR archive at `path` into the directory `dir`, which is created when
+/// missing.
+///
+/// The format is recognized by its contents, so a `.tar.gz` needs no special name. Throws
+/// `unsafe_path` for an entry that would end up outside `dir`: an absolute name, a `..`
+/// component, a symlink or hard link that points out of `dir`, or a path through a symlink.
+/// A ZIP archive is checked before anything is written; a TAR archive is read as a stream,
+/// so the entries before an unsafe one are already written.
+///
+/// Files get their mode without setuid, setgid, sticky and group or other write bits, and
+/// always owner read and write. Existing files are replaced.
++ fn extract(path: String, dir: String) !Error {
+    if is_zip(path) !> {
+        let zip = ZipReader.open(path) !>
+        zip.extract(dir) ! {
+            zip.close()
+            throw E
+        }
+        zip.close()
+        return
+    }
+    let tar = TarReader.open(path) !>
+    tar.extract(dir) ! {
+        tar.close()
+        throw E
+    }
+    tar.close()
+}
+
+/// Creates an archive at `path` with everything below the directory `dir`, named relative to
+/// it.
+///
+/// The format follows the extension: `.zip`, `.tar`, or `.tar.gz` / `.tgz` for a
+/// gzip-compressed TAR. Throws `unsupported` for any other extension. See `Writer.add_tree`.
++ fn create(path: String, dir: String) !Error {
+    let lower = path.lower()
+    let writer: Writer = <{
+        if lower.ends_with(".zip") : return ZipWriter.create(path) !>
+        if lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") : return TarWriter.create(path) !>
+        throw .unsupported { message: "Cannot tell the archive format of '" + path + "': use .zip, .tar, .tar.gz or .tgz" }
+    }
+    writer.add_tree(dir) !>
+    writer.close() !>
+}
+
+// ZIP files start with a local header, or an end record when empty
+fn is_zip(path: String) bool !Error {
+    let file = fs.stream(path) ! throw .io { message: "Cannot open '" + path + "'" }
+    let head = [u8]{ 0 x 4 }
+    let count = read_full(file, head) ! {
+        file.close() _
+        throw .io { message: "Cannot read '" + path + "'" }
+    }
+    file.close() _
+    return count == 4 && head[0] == 'P' && head[1] == 'K' && (head[2] == 3 || head[2] == 5) && head[3] == head[2] + 1
+}

@@ -1,0 +1,59 @@
+use archive
+use valk.fs
+use valk.time
+use valk.io
+
+// Cross-check and benchmark helper; see crosscheck.sh and bench.sh
+fn main(args: Array[String]) {
+    let command = args.get(1) !? ""
+    let a = args.get(2) !? ""
+    let b = args.get(3) !? ""
+    let start = time.unix_ms()
+    if command == "create" {
+        archive.create(a, b) ! panic(E.message)
+    } else if command == "extract" {
+        archive.extract(a, b) ! panic(E.message)
+    } else if command == "list" {
+        let count = list(a) ! panic(E.message)
+        println(count + " entries")
+    } else if command == "edge" {
+        edge(a) ! panic(E.message)
+    } else {
+        println("usage: main create|extract|list|edge ...")
+        return
+    }
+    io.stderr().write("%{command}: %{time.unix_ms() - start} ms\n") _
+}
+
+fn list(path: String) uint !archive.Error {
+    if path.ends_with(".zip") {
+        let zip = archive.ZipReader.open(path) !>
+        let count = zip.entries.length
+        zip.close()
+        return count
+    }
+    let tar = archive.TarReader.open(path) !>
+    let count: uint = 0
+    while isset(tar.next() !>) : count++
+    return count
+}
+
+// Archives with the cases a directory does not show
+fn edge(dir: String) !archive.Error {
+    let text = "edge case contents\n".repeat(1000)
+    each Array[String]{ "edge.zip", "edge.tar", "edge.tar.gz" } as name {
+        let path = fs.add(dir, name)
+        let writer: archive.Writer = name.ends_with(".zip") ? (archive.ZipWriter.create(path) !>) : (archive.TarWriter.create(path) !>)
+        writer.add("stored.txt", text, archive.Options { compress: false, mtime: 1234567890, mode: 0c600 }) !>
+        writer.add("deflated.txt", text, archive.Options { mtime: 1234567890 }) !>
+        writer.add_from("streamed.txt", text.reader(), text.length, archive.Options { mtime: 1234567890 }) !>
+        writer.add_from("streamed-stored.txt", text.reader(), text.length, archive.Options { mtime: 1234567890, compress: false }) !>
+        writer.add("dir/" + "n".repeat(120) + "/" + "m".repeat(120) + ".txt", "long name", archive.Options { mtime: 1234567890 }) !>
+        writer.add("naïve/文字.txt", "unicode", archive.Options { mtime: 1234567890 }) !>
+        writer.add_dir("empty-dir", archive.Options { mtime: 1234567890, mode: 0c700 }) !>
+        writer.add_symlink("link", "deflated.txt", archive.Options { mtime: 1234567890 }) !>
+        writer.add("run.sh", "#!/bin/sh\n", archive.Options { mtime: 1234567890, mode: 0c755 }) !>
+        writer.add("empty.txt", "", archive.Options { mtime: 1234567890 }) !>
+        writer.close() !>
+    }
+}

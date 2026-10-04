@@ -1,0 +1,150 @@
+use archive
+use valk.io
+
+fn zip_of(build: fn(archive.ZipWriter)(void !archive.Error)) String {
+    let out = ByteBuffer.new()
+    let zip = archive.ZipWriter.new(out)
+    build(zip) !!
+    zip.close() !!
+    return out.to_string()
+}
+
+test "ZIP round trip in memory" {
+    let text = sample_text(200000)
+    let noise = random_bytes(5000)
+    let data = zip_of(fn(zip: archive.ZipWriter) !archive.Error {
+        zip.add("a.txt", "hello") !>
+        zip.add("dir/big.txt", text, archive.Options { mtime: 1700000000, mode: 0c600 }) !>
+        zip.add("stored.txt", text, archive.Options { compress: false }) !>
+        zip.add("noise.bin", noise) !>
+        zip.add("empty", "") !>
+        zip.add_dir("dir/sub", archive.Options { mtime: 1600000000 }) !>
+        zip.add_symlink("link", "dir/big.txt") !>
+        zip.add("naïve/文字.txt", "unicode") !>
+    })
+    let zip = archive.ZipReader.from_bytes(data) !!
+    assert(zip.entries.length == 8)
+    assert(zip.read("a.txt") !! == "hello")
+    assert(zip.read("dir/big.txt") !! == text)
+    assert(zip.read("stored.txt") !! == text)
+    assert(zip.read("noise.bin") !! == noise)
+    assert(zip.read("empty") !! == "")
+    assert(zip.read("naïve/文字.txt") !! == "unicode")
+    let big = zip.find("dir/big.txt") ?! panic("missing")
+    assert(big.mtime == 1700000000)
+    assert(big.mode == 0c600)
+    assert(big.size == 200000)
+    assert(big.compressed_size < 100000)
+    assert(big.is_file())
+    // Data that does not get smaller is stored
+    let n = zip.find("noise.bin") ?! panic("missing")
+    assert(n.compressed_size == 5000)
+    let dir = zip.find("dir/sub/") ?! panic("missing")
+    assert(dir.is_dir())
+    assert(dir.mtime == 1600000000)
+    assert(dir.mode == 0c755)
+    let link = zip.find("link") ?! panic("missing")
+    assert(link.kind == archive.EntryKind.symlink)
+    assert(link.link == "dir/big.txt")
+    assert(!isset(zip.find("nope")))
+    let failed1 = false
+    zip.read("nope") ! failed1 = E.code == E.missing
+    assert(failed1)
+}
+
+test "ZIP streaming in and out" {
+    let text = sample_text(300000, 3)
+    let data = zip_of(fn(zip: archive.ZipWriter) !archive.Error {
+        zip.add_from("streamed.txt", TrickleReader { text: text, step: 1000 }, text.length) !>
+        zip.add_from("stored.txt", TrickleReader { text: text, step: 4096 }, text.length, archive.Options { compress: false }) !>
+        zip.add_from("empty.txt", TrickleReader { text: "", step: 1 }, 0) !>
+    })
+    let zip = archive.ZipReader.from_bytes(data) !!
+    assert(zip.read("streamed.txt") !! == text)
+    assert(zip.read("stored.txt") !! == text)
+    assert(zip.read("empty.txt") !! == "")
+    // An io.Reader over one entry
+    let reader = zip.stream("streamed.txt") !!
+    let all = io.read_all(reader, 1000) !!
+    assert(all == text)
+    let out = ByteBuffer.new()
+    assert(zip.read_into("stored.txt", out) !! == text.length)
+    assert(out == text)
+    // A source shorter than its size
+    let writer = archive.ZipWriter.new(ByteBuffer.new())
+    let failed2 = false
+    writer.add_from("short", TrickleReader { text: "abc", step: 1 }, 10) ! failed2 = E.code == E.io
+    assert(failed2)
+}
+
+test "ZIP damage is detected" {
+    let text = sample_text(10000)
+    let data = zip_of(fn(zip: archive.ZipWriter) !archive.Error {
+        zip.add("x.txt", text, archive.Options { compress: false }) !>
+        zip.add("y.txt", text) !>
+    })
+    // Flip a byte of the stored data: the CRC-32 no longer matches
+    let bytes = data.range(0, data.length)
+    let copy = ByteBuffer.new()
+    copy.write(bytes)
+    copy[100] = copy[100] ^ 1
+    let zip = archive.ZipReader.from_bytes(copy.to_string()) !!
+    let failed3 = false
+    zip.read("x.txt") ! failed3 = E.code == E.checksum
+    assert(failed3)
+    assert(zip.read("y.txt") !! == text)
+    let reader = zip.stream("x.txt") !!
+    let failed4 = false
+    io.read_all(reader) ! failed4 = E.code == E.read
+    assert(failed4)
+    // Not a ZIP at all, or cut short
+    let failed5 = false
+    archive.ZipReader.from_bytes("hello world, this is not a zip archive") ! failed5 = E.code == E.format
+    assert(failed5)
+    let failed6 = false
+    archive.ZipReader.from_bytes(data.range(0, data.length - 30)) ! failed6 = E.code == E.format
+    assert(failed6)
+}
+
+test "ZIP64 and many entries" {
+    let out = ByteBuffer.new()
+    let zip = archive.ZipWriter.new(out)
+    let i: uint = 0
+    while i < 70000 {
+        zip.add("f" + i, "" + i, archive.Options { compress: false }) !!
+        i++
+    }
+    zip.comment = "many"
+    zip.close() !!
+    let reader = archive.ZipReader.from_bytes(out.to_string()) !!
+    assert(reader.entries.length == 70000)
+    assert(reader.comment == "many")
+    assert(reader.read("f69999") !! == "69999")
+}
+
+test "ZIP with data before it" {
+    let data = zip_of(fn(zip: archive.ZipWriter) !archive.Error {
+        zip.add("a.txt", "prefixed") !>
+    })
+    let zip = archive.ZipReader.from_bytes("#!/bin/sh\nexit 0\n" + data) !!
+    assert(zip.read("a.txt") !! == "prefixed")
+}
+
+test "ZIP names" {
+    // Names are cleaned, and names that extract would refuse are refused
+    let data = zip_of(fn(zip: archive.ZipWriter) !archive.Error {
+        zip.add("./a//b.txt", "x") !>
+        let failed7 = false
+        zip.add("../evil", "x") ! failed7 = E.code == E.unsafe_path
+        assert(failed7)
+        let failed8 = false
+        zip.add("/abs", "x") ! failed8 = E.code == E.unsafe_path
+        assert(failed8)
+        let failed9 = false
+        zip.add("", "x") ! failed9 = E.code == E.unsafe_path
+        assert(failed9)
+    })
+    let zip = archive.ZipReader.from_bytes(data) !!
+    assert(zip.entries.length == 1)
+    assert(zip.entries[0].name == "a/b.txt")
+}

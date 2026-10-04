@@ -1,0 +1,263 @@
+use valk.io
+use valk.fs
+use valk.compress
+
+/// Writes a ZIP archive to any `io.Writer`, entry by entry.
+///
+/// Each entry is stored or deflated as its options say. ZIP64 records are written when an
+/// entry, the archive or the number of entries needs them, and names are marked as UTF-8.
+///
+/// ```valk
+/// let zip = archive.ZipWriter.create("site.zip") ! panic(E.message)
+/// zip.add("index.html", html) ! panic(E.message)
+/// zip.add_file("logo.png", "img/logo.png") ! panic(E.message)
+/// zip.close() ! panic(E.message)
+/// ```
++ class ZipWriter is Writer {
+    /// The archive comment, written by `close`.
+    + comment: String ("")
+    - output: Output
+    - records: Array[Entry] (.{})
+    - file: ?fs.FileStream (null)
+    - closed: bool (false)
+
+    /// Writes a ZIP archive to `out`. `close` ends the archive but does not close `out`.
+    + static fn new(out: io.Writer) ZipWriter {
+        return ZipWriter { output: Output { out: out } }
+    }
+
+    /// Creates the file at `path`, or replaces it, and writes a ZIP archive to it. `close`
+    /// closes the file.
+    + static fn create(path: String) ZipWriter !Error {
+        let file = fs.stream(path, fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! throw .io { message: "Cannot create '" + path + "'" }
+        let writer = ZipWriter.new(file)
+        writer.file = file
+        return writer
+    }
+
+    /// Adds a file with the contents `data`, deflated unless the options say otherwise.
+    ///
+    /// Throws `unsafe_path` for a name that `extract` would refuse: empty, absolute or with a
+    /// `..` component.
+    + fn add(name: String, data: local &[u8], options: Options (Options{})) !Error {
+        let entry = this.start(name, EntryKind.file, options) !>
+        entry.crc = crc32(data)
+        entry.size = data.length
+        let stored = true
+        if options.compress && data.length > 0 {
+            let packed = compress.deflate(data, options.level)
+            if packed.length < data.length {
+                stored = false
+                entry.method = 8
+                entry.compressed_size = packed.length
+                this.local_header(entry, false) !>
+                this.output.put(packed) !>
+            }
+        }
+        if stored {
+            entry.compressed_size = data.length
+            this.local_header(entry, false) !>
+            this.output.put(data) !>
+        }
+        this.records.append(entry)
+    }
+
+    /// Adds a file of exactly `size` bytes read from `source`, in pieces, deflated unless the
+    /// options say otherwise.
+    ///
+    /// The CRC-32 and the compressed size follow the data in a data descriptor. Throws `io`
+    /// when the source ends early; the archive cannot be used then.
+    + fn add_from(name: String, source: io.Reader, size: uint, options: Options (Options{})) !Error {
+        let entry = this.start(name, EntryKind.file, options) !>
+        entry.flags = entry.flags | 8
+        entry.size = size
+        let zip64 = size + size / 16 >= MAX32
+        if options.compress && size > 0 : entry.method = 8
+        this.local_header(entry, zip64) !>
+        let output = this.output
+        let start = output.offset
+        if entry.method == 8 {
+            let compressor = compress.Compressor.new(output, compress.Format.deflate, options.level)
+            entry.crc = copy_exact(source, compressor, size, true) !>
+            compressor.close() ! throw .io { message: "Writing the archive failed" }
+        } else {
+            entry.crc = copy_exact(source, output, size, true) !>
+        }
+        entry.compressed_size = output.offset - start
+        if !zip64 && entry.compressed_size >= MAX32 : throw .io { message: "The entry '" + name + "' compressed to 4 GiB or more" }
+        let descriptor = ByteBuffer.new(24)
+        descriptor.write_u32_le(SIG_DESCRIPTOR)
+        descriptor.write_u32_le(entry.crc)
+        if zip64 {
+            descriptor.write_u64_le(entry.compressed_size)
+            descriptor.write_u64_le(entry.size)
+        } else {
+            descriptor.write_u32_le(entry.compressed_size.to(u32))
+            descriptor.write_u32_le(entry.size.to(u32))
+        }
+        output.put(descriptor) !>
+        this.records.append(entry)
+    }
+
+    /// Adds a directory.
+    + fn add_dir(name: String, options: Options (Options{})) !Error {
+        let entry = this.start(name, EntryKind.directory, options) !>
+        this.local_header(entry, false) !>
+        this.records.append(entry)
+    }
+
+    /// Adds a symlink that points to `target`. The target is stored as the entry's contents,
+    /// as Info-ZIP does.
+    + fn add_symlink(name: String, target: String, options: Options (Options{})) !Error {
+        let entry = this.start(name, EntryKind.symlink, options) !>
+        entry.link = target
+        entry.crc = crc32(target)
+        entry.size = target.length
+        entry.compressed_size = target.length
+        this.local_header(entry, false) !>
+        this.output.put(target) !>
+        this.records.append(entry)
+    }
+
+    /// Writes the central directory and ends the archive; closes the file that `create`
+    /// opened.
+    ///
+    /// Calling it again does nothing.
+    + fn close() !Error {
+        if this.closed : return
+        this.closed = true
+        let output = this.output
+        let cd_start = output.offset
+        let buf = ByteBuffer.new(256)
+        each this.records as entry {
+            buf.clear()
+            let extra = ByteBuffer.new(32)
+            let zip64 = ByteBuffer.new(24)
+            if entry.size >= MAX32 : zip64.write_u64_le(entry.size)
+            if entry.compressed_size >= MAX32 : zip64.write_u64_le(entry.compressed_size)
+            if entry.header_offset >= MAX32 : zip64.write_u64_le(entry.header_offset)
+            if zip64.length > 0 {
+                extra.write_u16_le(1)
+                extra.write_u16_le(zip64.length.to(u16))
+                extra.write(zip64)
+            }
+            write_time_extra(extra, entry.mtime)
+            let version: u16 = zip64.length > 0 ? 45 : 20
+            let date, time = to_dos_time(entry.mtime)
+            let type: uint = entry.kind == EntryKind.directory ? 0c40000 : (entry.kind == EntryKind.symlink ? 0c120000 : 0c100000)
+            let attributes = ((type | entry.mode) << 16) | (entry.kind == EntryKind.directory ? 0x10 : 0)
+            buf.write_u32_le(SIG_CENTRAL)
+            buf.write_u16_le(0x0300 | version)
+            buf.write_u16_le(version)
+            buf.write_u16_le(entry.flags.to(u16))
+            buf.write_u16_le(entry.method.to(u16))
+            buf.write_u16_le(time.to(u16))
+            buf.write_u16_le(date.to(u16))
+            buf.write_u32_le(entry.crc)
+            buf.write_u32_le(clamp32(entry.compressed_size))
+            buf.write_u32_le(clamp32(entry.size))
+            buf.write_u16_le(entry.name.length.to(u16))
+            buf.write_u16_le(extra.length.to(u16))
+            buf.write_u16_le(0)
+            buf.write_u16_le(0)
+            buf.write_u16_le(0)
+            buf.write_u32_le(attributes.to(u32))
+            buf.write_u32_le(clamp32(entry.header_offset))
+            buf.write(entry.name)
+            buf.write(extra)
+            output.put(buf) !>
+        }
+        let cd_size = output.offset - cd_start
+        let count = this.records.length
+        buf.clear()
+        if count >= MAX16 || cd_start >= MAX32 || cd_size >= MAX32 {
+            let record_start = output.offset
+            buf.write_u32_le(SIG_EOCD64)
+            buf.write_u64_le(44)
+            buf.write_u16_le(0x0300 | 45)
+            buf.write_u16_le(45)
+            buf.write_u32_le(0)
+            buf.write_u32_le(0)
+            buf.write_u64_le(count)
+            buf.write_u64_le(count)
+            buf.write_u64_le(cd_size)
+            buf.write_u64_le(cd_start)
+            buf.write_u32_le(SIG_LOCATOR64)
+            buf.write_u32_le(0)
+            buf.write_u64_le(record_start)
+            buf.write_u32_le(1)
+        }
+        let comment = this.comment.length > MAX16 ? this.comment.range(0, MAX16) : this.comment
+        buf.write_u32_le(SIG_EOCD)
+        buf.write_u16_le(0)
+        buf.write_u16_le(0)
+        buf.write_u16_le((count >= MAX16 ? MAX16 : count).to(u16))
+        buf.write_u16_le((count >= MAX16 ? MAX16 : count).to(u16))
+        buf.write_u32_le(clamp32(cd_size))
+        buf.write_u32_le(clamp32(cd_start))
+        buf.write_u16_le(comment.length.to(u16))
+        buf.write(comment)
+        output.put(buf) !>
+        output.flush() ! throw .io { message: "Writing the archive failed" }
+        let file = this.file
+        if isset(file) : file.close() ! throw .io { message: "Writing the archive failed" }
+    }
+
+    fn start(name: String, kind: EntryKind, options: Options) Entry !Error {
+        if this.closed : throw .io { message: "The archive is closed" }
+        check_new_name(name) !>
+        let path = clean_name(name)
+        if kind == EntryKind.directory : path = path + "/"
+        return Entry {
+            name: path
+            kind: kind
+            mode: mode_of(options, kind)
+            mtime: options.mtime ?? now_seconds()
+            flags: is_ascii(path) ? 0 : 0x800
+            header_offset: this.output.offset
+        }
+    }
+
+    fn local_header(entry: Entry, zip64: bool) !Error {
+        let buf = ByteBuffer.new(64 + entry.name.length)
+        let extra = ByteBuffer.new(32)
+        // Sizes that are known go in the header; a data descriptor follows otherwise
+        let known = (entry.flags & 8) == 0
+        let big = zip64 || entry.size >= MAX32 || entry.compressed_size >= MAX32
+        if big {
+            extra.write_u16_le(1)
+            extra.write_u16_le(16)
+            extra.write_u64_le(known ? entry.size : 0)
+            extra.write_u64_le(known ? entry.compressed_size : 0)
+        }
+        write_time_extra(extra, entry.mtime)
+        let date, time = to_dos_time(entry.mtime)
+        buf.write_u32_le(SIG_LOCAL)
+        buf.write_u16_le(big ? 45 : 20)
+        buf.write_u16_le(entry.flags.to(u16))
+        buf.write_u16_le(entry.method.to(u16))
+        buf.write_u16_le(time.to(u16))
+        buf.write_u16_le(date.to(u16))
+        buf.write_u32_le(known ? entry.crc : 0)
+        buf.write_u32_le(big ? MAX32.to(u32) : (known ? entry.compressed_size.to(u32) : 0))
+        buf.write_u32_le(big ? MAX32.to(u32) : (known ? entry.size.to(u32) : 0))
+        buf.write_u16_le(entry.name.length.to(u16))
+        buf.write_u16_le(extra.length.to(u16))
+        buf.write(entry.name)
+        buf.write(extra)
+        this.output.put(buf) !>
+    }
+}
+
+fn clamp32(value: uint) u32 {
+    return value >= MAX32 ? MAX32.to(u32) : value.to(u32)
+}
+
+// The Info-ZIP extended timestamp, which keeps the exact modification time
+fn write_time_extra(extra: ByteBuffer, mtime: int) {
+    if mtime < 0 || mtime > 0x7fffffff : return
+    extra.write_u16_le(0x5455)
+    extra.write_u16_le(5)
+    extra.write_byte(1)
+    extra.write_u32_le(mtime.to(u32))
+}

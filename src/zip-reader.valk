@@ -1,0 +1,417 @@
+use valk.io
+use valk.fs
+use valk.mem
+use valk.compress
+
+value SIG_LOCAL (0x04034b50)
+value SIG_CENTRAL (0x02014b50)
+value SIG_EOCD (0x06054b50)
+value SIG_EOCD64 (0x06064b50)
+value SIG_LOCATOR64 (0x07064b50)
+value SIG_DESCRIPTOR (0x08074b50)
+value MAX32 (0xffffffff)
+value MAX16 (0xffff)
+
+fn copy_into(from: local &[u8], to: local mut &[u8]) {
+    @unsafe
+    let count = from.length < to.length ? from.length : to.length
+    mem.copy_bytes(from.data, to.data, count)
+}
+
+// Random access to the bytes of an archive: an open file or memory
+class ZipSource {
+    fd: Fd (0)
+    is_open: bool (false)
+    data: &[u8]
+    size: uint
+    in_memory: bool
+
+    fn read_at(offset: uint, buf: local mut &[u8]) uint !Error {
+        if offset >= this.size : return 0
+        let count = buf.length
+        if count > this.size - offset : count = this.size - offset
+        if this.in_memory {
+            copy_into(this.data.view(offset, count), buf)
+            return count
+        }
+        if !this.is_open : throw .io { message: "The ZIP archive is closed" }
+        let total: uint = 0
+        while total < count {
+            let n = io.read(this.fd, buf.view(total, count - total), offset + total) ! throw .io { message: "Reading the ZIP archive failed" }
+            if n == 0 : break
+            total += n
+        }
+        return total
+    }
+
+    fn read_exact(offset: uint, length: uint) &[u8] !Error {
+        if this.in_memory {
+            if offset > this.size || length > this.size - offset : throw .format { message: "The ZIP archive is truncated" }
+            return this.data.view(offset, length)
+        }
+        let buf = [u8]{ 0 x length }
+        if (this.read_at(offset, buf) !>) != length : throw .format { message: "The ZIP archive is truncated" }
+        return buf
+    }
+}
+
+// The stored bytes of one entry
+class SectionReader is io.Reader {
+    source: ZipSource
+    offset: uint
+    remaining: uint
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.remaining == 0 || buf.length == 0 : return 0
+        let count = buf.length > this.remaining ? this.remaining : buf.length
+        let n = this.source.read_at(this.offset, buf.view(0, count)) ! throw .read
+        if n == 0 : throw .read
+        this.offset += n
+        this.remaining -= n
+        return n
+    }
+}
+
+/// Reads the contents of one ZIP entry; returned by `ZipReader.stream`.
+///
+/// The CRC-32 and the size are checked when the end is reached: a mismatch, or data that is not
+/// valid deflate, throws `read`.
++ class ZipEntryReader is io.Reader {
+    - inner: io.Reader
+    - expected_crc: u32
+    - expected_size: uint
+    - crc: u32 (0)
+    - total: uint (0)
+    - done: bool (false)
+
+    /// Fills `buf` with the next bytes of the entry and returns the count; 0 at the end.
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        return this.read_checked(buf) ! throw .read
+    }
+
+    fn read_checked(buf: local mut &[u8]) uint !Error {
+        if this.done || buf.length == 0 : return 0
+        let count = this.inner.read(buf) ! throw .format { message: "The data of the entry is damaged" }
+        if count == 0 {
+            this.done = true
+            if this.total != this.expected_size : throw .format { message: "The entry has " + this.total + " bytes instead of " + this.expected_size }
+            if this.crc != this.expected_crc : throw .checksum { message: "The CRC-32 of the entry does not match" }
+            return 0
+        }
+        this.total += count
+        if this.total > this.expected_size : throw .format { message: "The entry holds more bytes than its size of " + this.expected_size }
+        this.crc = crc32(buf.view(0, count), this.crc)
+        return count
+    }
+
+    fn copy_to(out: io.Writer) uint !Error {
+        match out {
+            ByteBuffer as buffer => {
+                let start = buffer.length
+                while true {
+                    buffer.reserve(65536)
+                    let count = this.read_checked(buffer.view_spare(65536)) !>
+                    if count == 0 : break
+                    buffer.skip(count)
+                }
+                return buffer.length - start
+            }
+            default => {
+                let chunk = [u8]{ 0 x 65536 }
+                let total: uint = 0
+                while true {
+                    let count = this.read_checked(chunk) !>
+                    if count == 0 : break
+                    write_all(out, chunk.view(0, count)) ! throw .io { message: "Writing the entry failed" }
+                    total += count
+                }
+                return total
+            }
+        }
+    }
+}
+
+/// Reads a ZIP archive from a file or from memory.
+///
+/// The central directory is read when the archive is opened, so `entries` lists every entry
+/// at once, and any entry can be read without reading the ones before it.
+///
+/// ```valk
+/// let zip = archive.ZipReader.open("site.zip") ! panic(E.message)
+/// each zip.entries as entry : println(entry.name + " " + entry.size)
+/// let html = zip.read("index.html") ! panic(E.message)
+/// zip.close()
+/// ```
++ class ZipReader {
+    /// Every entry, in the order of the central directory.
+    ~ entries: Array[Entry] (.{})
+    /// The archive comment.
+    ~ comment: String ("")
+    - source: ZipSource
+    - index: Map[uint] (.{})
+    // Bytes before the archive, such as a self-extractor stub
+    - base: uint (0)
+
+    /// Opens the ZIP file at `path` and reads its central directory.
+    ///
+    /// The file stays open until `close`.
+    + static fn open(path: String) ZipReader !Error {
+        let size = fs.size(path) ! throw .io { message: "Cannot open '" + path + "'" }
+        let fd = fs.open(path) ! throw .io { message: "Cannot open '" + path + "'" }
+        let reader = ZipReader { source: ZipSource { fd: fd, is_open: true, data: "", size: size, in_memory: false } }
+        reader.load() ! {
+            reader.close()
+            throw E
+        }
+        return reader
+    }
+
+    /// Reads a ZIP archive that is in memory; the bytes are not copied.
+    + static fn from_bytes(data: &[u8]) ZipReader !Error {
+        let reader = ZipReader { source: ZipSource { data: data, size: data.length, in_memory: true } }
+        reader.load() !>
+        return reader
+    }
+
+    /// Returns the entry with this name, or `null`. A trailing `/` is ignored.
+    ///
+    /// When a name occurs twice, the last entry wins.
+    + fn find(name: String) ?Entry {
+        let index = this.index.get(name) ! {
+            if !name.ends_with("/") : return null
+            return this.find(name.rtrim("/"))
+        }
+        return this.entries.get(index) !? null
+    }
+
+    /// Returns the contents of the entry with this name.
+    ///
+    /// Throws `missing` when there is no such entry, `checksum` when the CRC-32 does not match
+    /// and `format` when the data is damaged. A symlink's contents are its target.
+    + fn read(name: String) String !Error {
+        let entry = this.get(name) !>
+        let out = ByteBuffer.new(entry.size + 1)
+        this.entry_reader(entry).copy_to(out) !>
+        return out.to_string()
+    }
+
+    /// Writes the contents of the entry with this name to `out` and returns the bytes written.
+    ///
+    /// The entry is read and written in pieces, so it never has to fit in memory. Throws as
+    /// `read` does, and `io` when `out` fails.
+    + fn read_into(name: String, out: io.Writer) uint !Error {
+        let entry = this.get(name) !>
+        return this.entry_reader(entry).copy_to(out) !>
+    }
+
+    /// Returns an `io.Reader` over the contents of the entry with this name.
+    ///
+    /// Several entries can be streamed at the same time. Throws `missing` when there is no such
+    /// entry.
+    + fn stream(name: String) ZipEntryReader !Error {
+        let entry = this.get(name) !>
+        return this.entry_reader(entry) !>
+    }
+
+    /// Extracts every entry into the directory `dir`, which is created when missing.
+    ///
+    /// Throws `unsafe_path`, before anything is written, when an entry would end up outside
+    /// `dir`: an absolute name, a `..` component or a symlink that points out of it. See
+    /// `archive.extract`.
+    + fn extract(dir: String) !Error {
+        each this.entries as entry {
+            check_entry(entry) !>
+        }
+        let target = Extractor.new(dir) !>
+        each this.entries as entry {
+            if entry.kind == EntryKind.file {
+                let file = target.create_file(entry) !>
+                if !isset(file) : continue
+                let reader = this.entry_reader(entry) ! {
+                    file.close() _
+                    throw E
+                }
+                reader.copy_to(file) ! {
+                    file.close() _
+                    throw E
+                }
+                file.close() ! throw .io { message: "Cannot write '" + entry.name + "'" }
+                continue
+            }
+            target.add(entry) !>
+        }
+    }
+
+    /// Closes the file; a reader made by `from_bytes` has nothing to close.
+    + fn close() {
+        let source = this.source
+        if source.is_open {
+            source.is_open = false
+            io.close(source.fd) _
+        }
+    }
+
+    fn get(name: String) Entry !Error {
+        return this.find(name) ?! throw .missing { message: "The archive has no entry '" + name + "'" }
+    }
+
+    fn entry_reader(entry: Entry) ZipEntryReader !Error {
+        if (entry.flags & 1) != 0 : throw .unsupported { message: "The entry '" + entry.name + "' is encrypted" }
+        if entry.method != 0 && entry.method != 8 : throw .unsupported { message: "The entry '" + entry.name + "' uses compression method " + entry.method + "; only stored and deflate are supported" }
+        let source = this.source
+        let offset = this.base + entry.header_offset
+        let header = source.read_exact(offset, 30) !>
+        if le32(header, 0) != SIG_LOCAL : throw .format { message: "The local header of '" + entry.name + "' is missing" }
+        let start = offset + 30 + le16(header, 26) + le16(header, 28)
+        if start > source.size || entry.compressed_size > source.size - start : throw .format { message: "The data of '" + entry.name + "' runs past the end of the archive" }
+        let inner: io.Reader = SectionReader { source: source, offset: start, remaining: entry.compressed_size }
+        if source.in_memory : inner = ByteReader.new(source.data.view(start, entry.compressed_size))
+        if entry.method == 8 : inner = compress.Decompressor.new(inner, compress.Format.deflate)
+        return ZipEntryReader { inner: inner, expected_crc: entry.crc, expected_size: entry.size }
+    }
+
+    fn load() !Error {
+        let source = this.source
+        let size = source.size
+        if size < 22 : throw .format { message: "Not a ZIP archive" }
+        let tail_length = size < 65557 ? size : 65557
+        let tail_start = size - tail_length
+        let tail = source.read_exact(tail_start, tail_length) !>
+        // The end record is the last signature whose comment fits
+        let at = tail_length - 22
+        let found = false
+        while true {
+            if tail[at] == 0x50 && le32(tail, at) == SIG_EOCD && at + 22 + le16(tail, at + 20) <= tail_length {
+                found = true
+                break
+            }
+            if at == 0 : break
+            at--
+        }
+        if !found : throw .format { message: "Not a ZIP archive: no end of central directory record" }
+        let count = le16(tail, at + 10)
+        let cd_size = le32(tail, at + 12)
+        let cd_offset = le32(tail, at + 16)
+        this.comment = tail.view(at + 22, le16(tail, at + 20)).to_string()
+        let end_start = tail_start + at
+        if end_start >= 20 {
+            let locator = source.read_exact(end_start - 20, 20) !>
+            if le32(locator, 0) == SIG_LOCATOR64 {
+                let record_offset = le64(locator, 8)
+                let record = source.read_exact(record_offset, 56) !>
+                if le32(record, 0) != SIG_EOCD64 {
+                    // Data before the archive moved the record: look right before the locator
+                    record_offset = end_start - 20 - 56
+                    record = source.read_exact(record_offset, 56) !>
+                    if le32(record, 0) != SIG_EOCD64 : throw .format { message: "The ZIP64 end of central directory record is missing" }
+                }
+                count = le64(record, 32)
+                cd_size = le64(record, 40)
+                cd_offset = le64(record, 48)
+                end_start = record_offset
+            }
+        }
+        if cd_offset + cd_size > end_start : throw .format { message: "The central directory runs past its end record" }
+        this.base = end_start - cd_size - cd_offset
+        if count > cd_size / 46 : throw .format { message: "The central directory is too small for " + count + " entries" }
+        let cd = source.read_exact(this.base + cd_offset, cd_size) !>
+        let entries = Array[Entry].new(count)
+        let pos: uint = 0
+        let i: uint = 0
+        while i < count {
+            if pos + 46 > cd.length || le32(cd, pos) != SIG_CENTRAL : throw .format { message: "The central directory is damaged" }
+            let name_length = le16(cd, pos + 28)
+            let extra_length = le16(cd, pos + 30)
+            let comment_length = le16(cd, pos + 32)
+            let next = pos + 46 + name_length + extra_length + comment_length
+            if next > cd.length : throw .format { message: "The central directory is damaged" }
+            entries.append(this.parse_entry(cd, pos, name_length, extra_length) !>)
+            pos = next
+            i++
+        }
+        this.entries = entries
+        each entries as entry, index {
+            this.index.set(entry.name, index)
+            if entry.kind == EntryKind.symlink && entry.compressed_size <= 65536 {
+                let out = ByteBuffer.new(entry.size + 1)
+                this.entry_reader(entry).copy_to(out) !>
+                entry.link = out.to_string()
+                entry.size = 0
+            }
+        }
+    }
+
+    fn parse_entry(cd: &[u8], pos: uint, name_length: uint, extra_length: uint) Entry !Error {
+        let made_by = le16(cd, pos + 4)
+        let flags = le16(cd, pos + 8)
+        let crc = le32(cd, pos + 16)
+        let compressed = le32(cd, pos + 20)
+        let size = le32(cd, pos + 24)
+        let attributes = le32(cd, pos + 38)
+        let offset = le32(cd, pos + 42)
+        let raw_name = cd.view(pos + 46, name_length)
+        let name = (flags & 0x800) != 0 ? raw_name.to_string() : decode_cp437(raw_name)
+        let mtime = from_dos_time(le16(cd, pos + 14), le16(cd, pos + 12))
+        // Extra fields
+        let extra = cd.view(pos + 46 + name_length, extra_length)
+        let at: uint = 0
+        while at + 4 <= extra.length {
+            let id = le16(extra, at)
+            let length = le16(extra, at + 2)
+            let data_at = at + 4
+            if data_at + length > extra.length : break
+            if id == 0x0001 {
+                // ZIP64: only the fields that overflowed, in this order
+                let k = data_at
+                let end = data_at + length
+                if size == MAX32 && k + 8 <= end {
+                    size = le64(extra, k)
+                    k += 8
+                }
+                if compressed == MAX32 && k + 8 <= end {
+                    compressed = le64(extra, k)
+                    k += 8
+                }
+                if offset == MAX32 && k + 8 <= end {
+                    offset = le64(extra, k)
+                    k += 8
+                }
+            } else if id == 0x5455 && length >= 5 && (extra[data_at] & 1) != 0 {
+                // Extended timestamp: a signed 32-bit modification time
+                let value = le32(extra, data_at + 1)
+                mtime = value >= 0x80000000 ? value.to(int) - 0x100000000 : value.to(int)
+            } else if id == 0x7075 && length >= 5 && extra[data_at] == 1 {
+                // Info-ZIP Unicode path, valid while it matches the name
+                if le32(extra, data_at + 1).to(u32) == crc32(raw_name) {
+                    name = extra.view(data_at + 5, length - 5).to_string()
+                }
+            }
+            at = data_at + length
+        }
+        let host = made_by >> 8
+        let unix_mode = attributes >> 16
+        let unix = (host == 3 || host == 19) && unix_mode != 0
+        let kind = EntryKind.file
+        if name.ends_with("/") || name.ends_with("\\") || (host == 0 && (attributes & 0x10) != 0) {
+            kind = EntryKind.directory
+        } else if unix && (unix_mode & 0xf000) == 0xa000 {
+            kind = EntryKind.symlink
+        }
+        let mode: u32 = unix ? (unix_mode & 0c7777).to(u32) : (kind == EntryKind.directory ? 0c755 : 0c644)
+        while name.ends_with("/") || name.ends_with("\\") {
+            name = name.range(0, name.length - 1)
+        }
+        return Entry {
+            name: name
+            kind: kind
+            size: kind == EntryKind.directory ? 0 : size
+            mode: mode
+            mtime: mtime
+            compressed_size: compressed
+            method: le16(cd, pos + 10)
+            crc: crc.to(u32)
+            flags: flags
+            header_offset: offset
+        }
+    }
+}

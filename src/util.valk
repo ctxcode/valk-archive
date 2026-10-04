@@ -1,0 +1,284 @@
+use valk.io
+use valk.time
+use valk.fs
+
+value FLUSH_SIZE (65536)
+
+// Buffers small writes to `out` and counts every byte, so writers know their offset
+class Output is io.Writer {
+    out: io.Writer
+    buffer: ByteBuffer (ByteBuffer.new(FLUSH_SIZE + 1024))
+    offset: uint (0)
+
+    + fn write(data: local &[u8]) uint !io.IoError {
+        this.offset += data.length
+        if this.buffer.length + data.length <= FLUSH_SIZE {
+            this.buffer.write(data)
+            return data.length
+        }
+        this.flush() !>
+        if data.length >= FLUSH_SIZE {
+            write_all(this.out, data) !>
+        } else {
+            this.buffer.write(data)
+        }
+        return data.length
+    }
+
+    fn put(data: local &[u8]) !Error {
+        this.write(data) ! throw .io { message: "Writing the archive failed" }
+    }
+
+    fn flush() !io.IoError {
+        let buffer = this.buffer
+        if buffer.length == 0 : return
+        write_all(this.out, buffer.view()) ! {
+            buffer.clear()
+            throw E
+        }
+        buffer.clear()
+    }
+}
+
+fn write_all(out: io.Writer, data: local &[u8]) !io.IoError {
+    let view = data
+    while view.length > 0 {
+        let written = out.write(view) !>
+        if written == 0 || written > view.length : throw .write
+        view = view.view(written, view.length - written)
+    }
+}
+
+// Fills `buf` from `source` unless the source ends first; returns the count
+fn read_full(source: io.Reader, buf: local mut &[u8]) uint !io.IoError {
+    let total: uint = 0
+    while total < buf.length {
+        let count = source.read(buf.view(total, buf.length - total)) ! {
+            if E.code == E.closed : return total
+            throw E
+        }
+        if count == 0 : break
+        total += count
+    }
+    return total
+}
+
+fn le16(data: local &[u8], at: uint) uint $inline {
+    return data[at].to(uint) | (data[at + 1].to(uint) << 8)
+}
+fn le32(data: local &[u8], at: uint) uint $inline {
+    return le16(data, at) | (le16(data, at + 2) << 16)
+}
+fn le64(data: local &[u8], at: uint) uint $inline {
+    return le32(data, at) | (le32(data, at + 4) << 32)
+}
+
+fn now_seconds() int {
+    return (time.unix_ms() / 1000).to(int)
+}
+
+//
+// Dates: ZIP stores DOS dates, which this package reads and writes as UTC
+//
+
+// Days since 1970-01-01 of a civil date
+fn days_from_civil(year: int, month: int, day: int) int {
+    let y = month <= 2 ? year - 1 : year
+    let era = (y >= 0 ? y : y - 399) / 400
+    let yoe = y - era * 400
+    let mp = month > 2 ? month - 3 : month + 9
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn civil_from_days(days: int) (int, int, int) {
+    let z = days + 719468
+    let era = (z >= 0 ? z : z - 146096) / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = mp < 10 ? mp + 3 : mp - 9
+    let year = yoe + era * 400
+    if month <= 2 : year++
+    return (year, month, day)
+}
+
+fn from_dos_time(dos_date: uint, dos_time: uint) int {
+    let year = ((dos_date >> 9) & 0x7f).to(int) + 1980
+    let month = ((dos_date >> 5) & 0xf).to(int)
+    let day = (dos_date & 0x1f).to(int)
+    if month < 1 : month = 1
+    if month > 12 : month = 12
+    if day < 1 : day = 1
+    let hour = ((dos_time >> 11) & 0x1f).to(int)
+    let minute = ((dos_time >> 5) & 0x3f).to(int)
+    let second = ((dos_time & 0x1f) * 2).to(int)
+    return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+// Returns (date, time); times outside 1980..2107 are clamped
+fn to_dos_time(unix: int) (uint, uint) {
+    let min = days_from_civil(1980, 1, 1) * 86400
+    let max = days_from_civil(2107, 12, 31) * 86400 + 86399
+    if unix < min : unix = min
+    if unix > max : unix = max
+    let days = unix / 86400
+    let rest = unix - days * 86400
+    let year, month, day = civil_from_days(days)
+    let date = ((year - 1980) << 9) | (month << 5) | day
+    let tm = ((rest / 3600) << 11) | (((rest / 60) % 60) << 5) | ((rest % 60) / 2)
+    return (date.to(uint), tm.to(uint))
+}
+
+//
+// Names
+//
+
+global cp437_table: ?Array[String] (null)
+
+// ZIP names without the UTF-8 flag are in code page 437
+fn decode_cp437(data: local &[u8]) String {
+    let ascii = true
+    each data as byte {
+        if byte >= 0x80 {
+            ascii = false
+            break
+        }
+    }
+    if ascii : return data.to_string()
+    let table = cp437_table
+    if !isset(table) {
+        table = "Ç ü é â ä à å ç ê ë è ï î ì Ä Å É æ Æ ô ö ò û ù ÿ Ö Ü ¢ £ ¥ ₧ ƒ á í ó ú ñ Ñ ª º ¿ ⌐ ¬ ½ ¼ ¡ « » ░ ▒ ▓ │ ┤ ╡ ╢ ╖ ╕ ╣ ║ ╗ ╝ ╜ ╛ ┐ └ ┴ ┬ ├ ─ ┼ ╞ ╟ ╚ ╔ ╩ ╦ ╠ ═ ╬ ╧ ╨ ╤ ╥ ╙ ╘ ╒ ╓ ╫ ╪ ┘ ┌ █ ▄ ▌ ▐ ▀ α ß Γ π Σ σ µ τ Φ Θ Ω δ ∞ φ ε ∩ ≡ ± ≥ ≤ ⌠ ⌡ ÷ ≈ ° ∙ · √ ⁿ ² ■ \xc2\xa0".split(" ")
+        cp437_table = table
+    }
+    let out = ByteBuffer.new(data.length * 2)
+    each data as byte {
+        if byte < 0x80 : out.write_byte(byte)
+        else : out.write(table.get(byte - 0x80) !? "?")
+    }
+    return out.to_string()
+}
+
+fn is_ascii(data: local &[u8]) bool {
+    each data as byte {
+        if byte >= 0x80 : return false
+    }
+    return true
+}
+
+// Turns a name into `a/b/c`: `\` and repeated `/` become one `/`, and `.` components and
+// slashes at either end go
+fn clean_name(name: String) String {
+    let parts = name.replace("\\", "/").split("/")
+    let out = ByteBuffer.new(name.length)
+    each parts as part {
+        if part.length == 0 || part == "." : continue
+        if out.length > 0 : out.write_byte('/')
+        out.write(part)
+    }
+    return out.to_string()
+}
+
+// Throws when a name would leave the directory it is extracted into
+fn check_name(name: String) !Error {
+    if name.contains_byte(0) : throw .unsafe_path { message: "The entry name '" + name.escape() + "' holds a zero byte" }
+    if name.starts_with("/") || name.starts_with("\\") : throw .unsafe_path { message: "The entry name '" + name + "' is an absolute path" }
+    if name.length >= 2 && name[1] == ':' : throw .unsafe_path { message: "The entry name '" + name + "' starts with a drive letter" }
+    each name.replace("\\", "/").split("/") as part {
+        if part == ".." : throw .unsafe_path { message: "The entry name '" + name + "' leaves the directory with '..'" }
+    }
+}
+
+// Whether a link target, relative to the directory of `name`, stays inside the root
+fn link_stays_inside(name: String, target: String) bool {
+    if target.length == 0 : return false
+    if target.starts_with("/") || target.starts_with("\\") : return false
+    if target.length >= 2 && target[1] == ':' : return false
+    let parts = clean_name(name).split("/")
+    parts.pop_last() _
+    let depth = parts.length
+    each target.replace("\\", "/").split("/") as part {
+        if part.length == 0 || part == "." : continue
+        if part == ".." {
+            if depth == 0 : return false
+            depth--
+        } else {
+            depth++
+        }
+    }
+    return true
+}
+
+#if OS != "win"
+// The same prototype as the standard library's, which keeps it private
+extern fn readlink(pathname: cstring, buf: ptr, bufsiz: uint) int;
+#end
+
+// Returns the target of a symlink
+fn read_link(path: String) String !Error {
+    #if OS == "win"
+    throw .unsupported { message: "Reading symlinks is not supported on Windows" }
+    #else
+    @unsafe
+    let buf = [u8]{ 0 x 4096 }
+    let length = readlink(path.data_cstring, buf.data.@cast(ptr), 4096)
+    if length < 0 || length.to(uint) >= 4096 : throw .io { message: "Cannot read the symlink '" + path + "'" }
+    return buf.view(0, length.to(uint)).to_string()
+    #end
+}
+
+//
+// CRC-32 by slicing 8 bytes at a time, several times faster than a byte at a time
+//
+
+global crc_tables: ?mut &[u32] (null)
+
+fn crc_table() mut &[u32] {
+    let existing = crc_tables
+    if isset(existing) : return existing
+    let t = [u32]{ 0 x 2048 }
+    let i: uint = 0
+    while i < 256 {
+        let c = i.to(u32)
+        let k: uint = 0
+        while k < 8 {
+            c = (c & 1) != 0 ? 0xedb88320 ^ (c >> 1) : c >> 1
+            k++
+        }
+        t[i] = c
+        i++
+    }
+    i = 0
+    while i < 256 {
+        let c = t[i]
+        let s: uint = 1
+        while s < 8 {
+            c = t[c & 0xff] ^ (c >> 8)
+            t[s * 256 + i] = c
+            s++
+        }
+        i++
+    }
+    crc_tables = t
+    return t
+}
+
+fn crc32(data: local &[u8], crc: u32 (0)) u32 {
+    let t = crc_table()
+    let c = crc ^ 0xffffffff
+    let i: uint = 0
+    let n = data.length
+    while i + 8 <= n {
+        let a = c ^ (data[i].to(u32) | (data[i + 1].to(u32) << 8) | (data[i + 2].to(u32) << 16) | (data[i + 3].to(u32) << 24))
+        c = t[1792 + (a & 0xff)] ^ t[1536 + ((a >> 8) & 0xff)] ^ t[1280 + ((a >> 16) & 0xff)] ^ t[1024 + (a >> 24)] ^ t[768 + data[i + 4]] ^ t[512 + data[i + 5]] ^ t[256 + data[i + 6]] ^ t[data[i + 7]]
+        i += 8
+    }
+    while i < n {
+        c = t[(c ^ data[i]) & 0xff] ^ (c >> 8)
+        i++
+    }
+    return c ^ 0xffffffff
+}

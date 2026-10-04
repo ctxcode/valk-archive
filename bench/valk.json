@@ -1,0 +1,8 @@
+{
+    "src": ".",
+    "dependencies": {
+        "archive": {
+            "src": "../"
+        }
+    }
+}

@@ -1,0 +1,42 @@
+use archive
+use valk.fs
+
+fn main() {
+    let dir = "example/tmp"
+    fs.delete_all(dir) _
+    fs.create_dir_all(dir) ! panic("Cannot create " + dir)
+
+    // Write a ZIP entry by entry
+    let zip = archive.ZipWriter.create(dir + "/site.zip") ! panic(E.message)
+    zip.add("index.html", "<h1>Hello</h1>") ! panic(E.message)
+    zip.add("notes/todo.txt", "write docs\n".repeat(100)) ! panic(E.message)
+    zip.add_dir("empty") ! panic(E.message)
+    zip.close() ! panic(E.message)
+
+    // List it and read one entry
+    let reader = archive.ZipReader.open(dir + "/site.zip") ! panic(E.message)
+    each reader.entries as entry {
+        println(entry.name + " (" + entry.kind + ", " + entry.size + " bytes, " + entry.compressed_size + " stored)")
+    }
+    println(reader.read("index.html") ! panic(E.message))
+    reader.close()
+
+    // A .tar.gz, read back as a stream
+    let tar = archive.TarWriter.create(dir + "/site.tar.gz") ! panic(E.message)
+    tar.add("index.html", "<h1>Hello</h1>") ! panic(E.message)
+    tar.add_symlink("home.html", "index.html") ! panic(E.message)
+    tar.close() ! panic(E.message)
+
+    let stream = archive.TarReader.open(dir + "/site.tar.gz") ! panic(E.message)
+    while true {
+        let entry = stream.next() ! panic(E.message)
+        if !isset(entry) : break
+        if entry.kind == archive.EntryKind.symlink : println(entry.name + " -> " + entry.link)
+        else : println(entry.name + ": " + (stream.read() ! panic(E.message)))
+    }
+
+    // Whole directories
+    archive.extract(dir + "/site.zip", dir + "/site") ! panic(E.message)
+    archive.create(dir + "/copy.tar.gz", dir + "/site") ! panic(E.message)
+    println("extracted: " + (fs.files_in(dir + "/site", true, true, true, true) ! panic("list")).join(", "))
+}

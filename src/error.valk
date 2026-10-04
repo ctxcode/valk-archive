@@ -1,0 +1,13 @@
+/// Thrown when an archive cannot be read, written or extracted.
+///
+/// - `format`: the data is not a valid ZIP or TAR archive, or ends too early.
+/// - `checksum`: an entry's CRC-32, or a TAR header checksum, does not match.
+/// - `unsupported`: a feature this package does not read, such as encryption or a compression
+///   method other than stored and deflate.
+/// - `unsafe_path`: an entry would be written outside the destination directory: an absolute
+///   name, a `..` component, or a symlink that leads out of it.
+/// - `missing`: no entry has the name that was asked for.
+/// - `io`: reading the source or writing the destination failed.
++ error Error (format, checksum, unsupported, unsafe_path, missing, io) payload {
+    message: String
+}

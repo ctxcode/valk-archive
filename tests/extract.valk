@@ -1,0 +1,139 @@
+use archive
+use valk.fs
+
+// Writes a small tree to disk
+fn make_tree(dir: String) {
+    fs.create_dir_all(dir + "/sub/deeper") !!
+    fs.create_dir_all(dir + "/empty") !!
+    fs.write(dir + "/a.txt", "alpha") !!
+    fs.write(dir + "/sub/b.txt", sample_text(70000)) !!
+    fs.write(dir + "/sub/deeper/run.sh", "#!/bin/sh\necho hi\n") !!
+    fs.chmod(dir + "/sub/deeper/run.sh", 0c755) !!
+    #if OS != "win"
+    fs.symlink(dir + "/link", "sub/b.txt") !!
+    #end
+}
+
+fn same_tree(a: String, b: String) bool {
+    let left = fs.files_in(a, true, true, true, true) !!
+    let right = fs.files_in(b, true, true, true, true) !!
+    left.sort()
+    right.sort()
+    if left != right {
+        println("trees differ: " + left.join(",") + " / " + right.join(","))
+        return false
+    }
+    each left as rel {
+        let pa = fs.add(a, rel)
+        let pb = fs.add(b, rel)
+        if fs.is_symlink(pa) != fs.is_symlink(pb) : return false
+        if fs.is_dir(pa) : continue
+        if (fs.read(pa) !!) != (fs.read(pb) !!) : return false
+        if (fs.stat(pa) !!).permissions != (fs.stat(pb) !!).permissions {
+            println("modes differ for " + rel)
+            return false
+        }
+    }
+    return true
+}
+
+test "Create and extract a directory" {
+    let root = temp_dir("roundtrip")
+    make_tree(root + "/src")
+    each Array[String]{ "out.zip", "out.tar", "out.tar.gz", "out.tgz" } as name {
+        let path = root + "/" + name
+        archive.create(path, root + "/src") !!
+        let dest = root + "/x-" + name
+        archive.extract(path, dest) !!
+        assert(same_tree(root + "/src", dest))
+        #if OS != "win"
+        assert(fs.is_symlink(dest + "/link"))
+        assert((fs.read(dest + "/link") !!) == (fs.read(root + "/src/sub/b.txt") !!))
+        #end
+        assert(fs.is_dir(dest + "/empty"))
+    }
+    let failed = false
+    archive.create(root + "/out.rar", root + "/src") ! failed = E.code == E.unsupported
+    assert(failed)
+}
+
+test "Extract refuses unsafe entries" {
+    let root = temp_dir("unsafe")
+    let names = Array[String]{ "../evil.txt", "/abs.txt", "a/../../evil.txt", "C:/win.txt", "a\\..\\..\\evil.txt" }
+    // A writer refuses these names, so build TAR archives by hand
+    each names as name {
+        let data = raw_tar(name, '0', "")
+        let failed = false
+        archive.TarReader.new(TrickleReader { text: data, step: 512 }).extract(root + "/t") ! failed = E.code == E.unsafe_path
+        assert(failed)
+    }
+    assert(!fs.exists(root + "/evil.txt"))
+    // Symlinks that lead out
+    each Array[String]{ "../outside", "/etc", "a/../../x", "" } as target {
+        let failed = false
+        archive.TarReader.new(TrickleReader { text: raw_tar("l", '2', target), step: 512 }).extract(root + "/t") ! failed = E.code == E.unsafe_path
+        assert(failed)
+    }
+    #if OS != "win"
+    // A symlink inside is fine, but nothing is written through it
+    let data = raw_tar("d", '2', ".") + raw_tar("d/x.txt", '0', "")
+    let failed = false
+    archive.TarReader.new(TrickleReader { text: data, step: 512 }).extract(root + "/t2") ! failed = E.code == E.unsafe_path
+    assert(failed)
+    assert(fs.is_symlink(root + "/t2/d"))
+    assert(!fs.exists(root + "/t2/x.txt"))
+    #end
+    // A hard link to a file outside
+    let failed2 = false
+    archive.TarReader.new(TrickleReader { text: raw_tar("h", '1', "../../etc/passwd"), step: 512 }).extract(root + "/t3") ! failed2 = E.code == E.unsafe_path
+    assert(failed2)
+    // A hard link inside is a copy
+    let ok = raw_tar("f.txt", '0', "") + raw_tar("h.txt", '1', "f.txt")
+    archive.TarReader.new(TrickleReader { text: ok, step: 512 }).extract(root + "/t4") !!
+    assert(fs.read(root + "/t4/h.txt") !! == "data")
+}
+
+test "ZIP extract checks every entry first" {
+    let root = temp_dir("zipunsafe")
+    let out = ByteBuffer.new()
+    let zip = archive.ZipWriter.new(out)
+    zip.add("good.txt", "fine") !!
+    zip.add_symlink("bad", "../../outside") !!
+    zip.close() !!
+    let reader = archive.ZipReader.from_bytes(out.to_string()) !!
+    let failed = false
+    reader.extract(root + "/z") ! failed = E.code == E.unsafe_path
+    assert(failed)
+    assert(!fs.exists(root + "/z/good.txt"))
+}
+
+// One TAR header block with "data" as the contents of a file, then the end blocks
+fn raw_tar(name: String, type: u8, link: String) String {
+    let block = [u8]{ 0 x 512 }
+    let put = fn(at: uint, text: String) {
+        each text as byte, i : block[at + i] = byte
+    }
+    put(0, name)
+    put(100, "0000644")
+    put(108, "0000000")
+    put(116, "0000000")
+    put(124, type == '0' ? "00000000004" : "00000000000")
+    put(136, "14000000000")
+    block[156] = type
+    put(157, link)
+    put(257, "ustar")
+    put(263, "00")
+    put(148, "        ")
+    let sum: uint = 0
+    each block as byte : sum += byte
+    let text = sum.to_base(8).pad_left('0', 6)
+    put(148, text)
+    block[154] = 0
+    let out = ByteBuffer.new()
+    out.write(block)
+    if type == '0' {
+        out.write("data")
+        out.write([u8]{ 0 x 508 })
+    }
+    return out.to_string()
+}

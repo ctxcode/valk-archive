@@ -1,0 +1,58 @@
+/// What an archive entry is.
++ enum EntryKind {
+    /// A regular file.
+    file
+    /// A directory.
+    directory
+    /// A symbolic link, with its target in `link`.
+    symlink
+    /// A TAR hard link: another name for an earlier entry, given in `link`.
+    hardlink
+    /// Devices, FIFOs and other special files; extraction skips them.
+    other
+}
+
+/// One file, directory or link in an archive.
++ class Entry {
+    /// The path inside the archive, with `/` between components and no trailing `/`.
+    + name: String
+    /// What the entry is: a file, a directory, a link or something else.
+    + kind: EntryKind (EntryKind.file)
+    /// The size of the contents in bytes; 0 for directories and links.
+    + size: uint (0)
+    /// The permission bits, such as `0c644`.
+    + mode: u32 (0c644)
+    /// The modification time in seconds since the Unix epoch.
+    + mtime: int (0)
+    /// The target of a symlink or hard link; empty otherwise.
+    + link: String ("")
+    /// ZIP: the size of the stored data, compressed or not. TAR: the same as `size`.
+    + compressed_size: uint (0)
+    // ZIP only
+    method: uint (0)
+    crc: u32 (0)
+    flags: uint (0)
+    header_offset: uint (0)
+
+    /// Whether this is a regular file.
+    + fn is_file() bool { return this.kind == EntryKind.file }
+    /// Whether this is a directory.
+    + fn is_dir() bool { return this.kind == EntryKind.directory }
+}
+
+/// How an entry is written. Every field has a default:
+///
+/// ```valk
+/// zip.add("run.sh", script, archive.Options { mode: 0c755 }) ! panic(E.message)
+/// ```
++ struct Options {
+    /// The permission bits; 0 means `0c644` for files, `0c755` for directories and `0c777` for
+    /// symlinks.
+    + mode: u32 (0)
+    /// The modification time in seconds since the Unix epoch; `null` means now.
+    + mtime: ?int (null)
+    /// ZIP only: deflate the contents. A file that does not get smaller is stored as it is.
+    + compress: bool (true)
+    /// ZIP only: the deflate level, from 1 (fastest) to 9 (smallest).
+    + level: uint (6)
+}

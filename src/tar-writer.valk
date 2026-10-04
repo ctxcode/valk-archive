@@ -1,0 +1,218 @@
+use valk.io
+use valk.fs
+use valk.compress
+
+// The largest value an 11-digit octal field holds
+value OCTAL_MAX (0c77777777777)
+
+/// Writes a TAR archive in the PAX format, gzip-compressed or not, to any `io.Writer`.
+///
+/// Names and link targets that do not fit a ustar header, sizes from 8 GiB and times outside
+/// the ustar range are written in PAX records, which every current `tar` reads.
+///
+/// ```valk
+/// let tar = archive.TarWriter.create("backup.tar.gz") ! panic(E.message)
+/// tar.add("notes.txt", "hello") ! panic(E.message)
+/// tar.add_tree("photos", "photos/") ! panic(E.message)
+/// tar.close() ! panic(E.message)
+/// ```
++ class TarWriter is Writer {
+    - output: Output
+    - compressor: ?compress.Compressor (null)
+    - file: ?fs.FileStream (null)
+    - closed: bool (false)
+
+    /// Writes a TAR archive to `out`, gzip-compressed when `gzip` is set.
+    ///
+    /// `close` ends the archive but does not close `out`.
+    + static fn new(out: io.Writer, gzip: bool (false)) TarWriter {
+        if !gzip : return TarWriter { output: Output { out: out } }
+        let compressor = compress.Compressor.new(out, compress.Format.gzip)
+        return TarWriter { output: Output { out: compressor }, compressor: compressor }
+    }
+
+    /// Creates the file at `path`, or replaces it, and writes a TAR archive to it.
+    ///
+    /// A path that ends in `.gz` or `.tgz` gets a gzip-compressed archive. `close` closes the
+    /// file.
+    + static fn create(path: String) TarWriter !Error {
+        let file = fs.stream(path, fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! throw .io { message: "Cannot create '" + path + "'" }
+        let lower = path.lower()
+        let writer = TarWriter.new(file, lower.ends_with(".gz") || lower.ends_with(".tgz"))
+        writer.file = file
+        return writer
+    }
+
+    /// Adds a file with the contents `data`.
+    ///
+    /// Throws `unsafe_path` for a name that `extract` would refuse: empty, absolute or with a
+    /// `..` component.
+    + fn add(name: String, data: local &[u8], options: Options (Options{})) !Error {
+        this.header(name, '0', data.length, mode_of(options, EntryKind.file), options.mtime, "") !>
+        this.output.put(data) !>
+        this.pad(data.length) !>
+    }
+
+    /// Adds a file of exactly `size` bytes read from `source`, in pieces.
+    ///
+    /// TAR needs the size before the contents. Throws `io` when the source ends early; the
+    /// archive cannot be used then.
+    + fn add_from(name: String, source: io.Reader, size: uint, options: Options (Options{})) !Error {
+        this.header(name, '0', size, mode_of(options, EntryKind.file), options.mtime, "") !>
+        copy_exact(source, this.output, size, false) !>
+        this.pad(size) !>
+    }
+
+    /// Adds a directory.
+    + fn add_dir(name: String, options: Options (Options{})) !Error {
+        this.header(name, '5', 0, mode_of(options, EntryKind.directory), options.mtime, "") !>
+    }
+
+    /// Adds a symlink that points to `target`.
+    + fn add_symlink(name: String, target: String, options: Options (Options{})) !Error {
+        this.header(name, '2', 0, mode_of(options, EntryKind.symlink), options.mtime, target) !>
+    }
+
+    /// Ends the archive and writes what is left; closes the file that `create` opened.
+    ///
+    /// Calling it again does nothing.
+    + fn close() !Error {
+        if this.closed : return
+        this.closed = true
+        // Two zero blocks end the archive; tar pads it to a whole record of 10 KiB
+        let output = this.output
+        let total = output.offset + 1024
+        let record = (10240 - total % 10240) % 10240
+        output.put([u8]{ 0 x 1024 + record }) !>
+        output.flush() ! throw .io { message: "Writing the archive failed" }
+        let compressor = this.compressor
+        if isset(compressor) : compressor.close() ! throw .io { message: "Writing the archive failed" }
+        let file = this.file
+        if isset(file) : file.close() ! throw .io { message: "Writing the archive failed" }
+    }
+
+    fn pad(size: uint) !Error {
+        let padding = (512 - size % 512) % 512
+        if padding > 0 : this.output.put([u8]{ 0 x padding }) !>
+    }
+
+    fn header(name: String, type: u8, size: uint, mode: u32, mtime_option: ?int, link: String) !Error {
+        if this.closed : throw .io { message: "The archive is closed" }
+        check_new_name(name) !>
+        let path = clean_name(name)
+        if type == '5' : path = path + "/"
+        let mtime = mtime_option ?? now_seconds()
+        let pax = ByteBuffer.new(0)
+        // ustar splits a long name into a prefix and a name at a slash
+        let prefix = ""
+        let short = path
+        if path.length > 100 && is_ascii(path) {
+            let split = split_ustar(path)
+            if isset(split) {
+                prefix = split
+                short = path.range(split.length + 1, path.length - split.length - 1)
+            }
+        }
+        if short.length > 100 || !is_ascii(path) {
+            add_pax(pax, "path", path)
+            short = path.range(0, 100)
+            prefix = ""
+        }
+        let link_field = link
+        if link.length > 100 || !is_ascii(link) {
+            add_pax(pax, "linkpath", link)
+            link_field = link.range(0, 100)
+        }
+        let size_field = size
+        if size > OCTAL_MAX {
+            add_pax(pax, "size", size.to(String))
+            size_field = 0
+        }
+        let mtime_field: uint = 0
+        if mtime < 0 || mtime > OCTAL_MAX {
+            add_pax(pax, "mtime", mtime.to(String))
+        } else {
+            mtime_field = mtime.to(uint)
+        }
+        if pax.length > 0 {
+            let block = header_block("././@PaxHeader", 'x', pax.length, 0c644, mtime_field, "", "")
+            this.output.put(block) !>
+            this.output.put(pax) !>
+            this.pad(pax.length) !>
+        }
+        this.output.put(header_block(short, type, size_field, mode, mtime_field, link_field, prefix)) !>
+    }
+}
+
+// Where to split a long ustar name: the length of the prefix, or null when it does not fit
+fn split_ustar(path: String) ?String {
+    // The prefix holds at most 155 bytes and the name at most 100
+    let start: uint = path.length > 101 ? path.length - 101 : 1
+    let i = start
+    while i < path.length && i <= 155 {
+        if path[i] == '/' && path.length - i - 1 <= 100 : return path.range(0, i)
+        i++
+    }
+    return null
+}
+
+// "<length> <key>=<value>\n", where the length counts itself
+fn add_pax(out: ByteBuffer, key: String, value: String) {
+    let base = key.length + value.length + 3
+    let length = base + base.to(String).length
+    if length.to(String).length + base != length : length = base + length.to(String).length
+    out.write(length.to(String))
+    out.write_byte(' ')
+    out.write(key)
+    out.write_byte('=')
+    out.write(value)
+    out.write_byte('\n')
+}
+
+fn header_block(name: String, type: u8, size: uint, mode: u32, mtime: uint, link: String, prefix: String) mut &[u8] {
+    let block = [u8]{ 0 x 512 }
+    put_text(block, 0, 100, name)
+    put_octal(block, 100, 8, mode)
+    put_octal(block, 108, 8, 0)
+    put_octal(block, 116, 8, 0)
+    put_octal(block, 124, 12, size)
+    put_octal(block, 136, 12, mtime)
+    block[156] = type
+    put_text(block, 157, 100, link)
+    put_text(block, 257, 6, "ustar")
+    block[263] = '0'
+    block[264] = '0'
+    put_octal(block, 329, 8, 0)
+    put_octal(block, 337, 8, 0)
+    put_text(block, 345, 155, prefix)
+    // The checksum is summed with its own field as spaces
+    let i: uint = 148
+    while i < 156 {
+        block[i] = ' '
+        i++
+    }
+    let sum: uint = 0
+    each block as byte : sum += byte
+    put_octal(block, 148, 7, sum)
+    return block
+}
+
+fn put_text(block: local mut &[u8], at: uint, max: uint, text: String) {
+    let count = text.length < max ? text.length : max
+    let i: uint = 0
+    while i < count {
+        block[at + i] = text[i]
+        i++
+    }
+}
+
+// `width - 1` octal digits and a NUL
+fn put_octal(block: local mut &[u8], at: uint, width: uint, value: uint) {
+    let i = width - 1
+    block[at + i] = 0
+    while i > 0 {
+        i--
+        block[at + i] = '0' + (value & 7).to(u8)
+        value = value >> 3
+    }
+}
